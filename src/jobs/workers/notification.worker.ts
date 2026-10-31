@@ -170,7 +170,7 @@ export const notificationWorker = new Worker(
       const userIds = members.map((m) => m.userId);
       if (!userIds.length) return;
 
-      await pushService.sendIncomingCallToUsers(userIds, {
+      const ringPayload = {
         title: channelName,
         body: `${startedByName} started a group call`,
         ttlMs,
@@ -196,7 +196,11 @@ export const notificationWorker = new Worker(
           expiresAt: expiresAt.toISOString(),
           deepLink: `dgc://channels/${channelId}/calls/${roomId}`,
         },
-      });
+      };
+      // Batched like the other fan-outs so a large cluster doesn't load every device token at once.
+      for (let i = 0; i < userIds.length; i += BATCH) {
+        await pushService.sendIncomingCallToUsers(userIds.slice(i, i + BATCH), ringPayload);
+      }
       logger.info({ jobId: job.id, roomId, channelId, notified: userIds.length }, 'Channel call ring fan-out complete');
       return;
     }

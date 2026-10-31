@@ -61,6 +61,7 @@ export const cacheKeys = {
   channelMeta: (channelId: string) => `cache:channel:${channelId}:meta`,
   channelMembers: (channelId: string) => `cache:channel:${channelId}:members`,
   userProfile: (userId: string) => `cache:user:${userId}:profile`,
+  userAdminScopes: (userId: string) => `cache:user:${userId}:admin-scopes`,
   branches: 'cache:branches',
   branch: (id: string) => `cache:branch:${id}`,
   clusters: 'cache:clusters',

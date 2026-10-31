@@ -3,7 +3,7 @@ import { joinAudioRoom, emitToAudioRoom, emitToUser, closeAudioRoom } from '../.
 import { notificationQueue } from '../../infra/queue';
 import { enqueue } from '../../infra/enqueue';
 import { redis, withDeadline } from '../../infra/redis';
-import { audioRoomService, stableUid } from '../audio-rooms/audio-rooms.service';
+import { addParticipantIfLive, audioRoomService, stableUid } from '../audio-rooms/audio-rooms.service';
 import { isClusterModerator } from '../../utils/authorization';
 import { BadRequest, Forbidden, NotFound } from '../../utils/errors';
 
@@ -126,10 +126,8 @@ export const prayerWatchService = {
       });
       if (!p) {
         // Fresh join → SPEAKER for everyone.
-        const created = await prisma.audioRoomParticipant.create({
-          data: { roomId: existing.id, userId, role: 'SPEAKER' },
-          select: PARTICIPANT_SELECT,
-        });
+        // Guarded insert: fails with "Room is not live" if the last participant just ended it.
+        const created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
         joinAudioRoom(userId, existing.id);
         emitToAudioRoom(existing.id, 'audio-room:user-joined', { ...created, agoraUid: stableUid(userId) });
       } else if (p.role === 'LISTENER') {

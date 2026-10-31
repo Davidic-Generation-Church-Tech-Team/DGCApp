@@ -26,7 +26,7 @@ This part does not cover 1:1 DM calls (see `DM_CALLS_FRONTEND_GUIDE.md`) or the 
 
 ### The rules
 
-- **Starting:** any member of the channel can start a call. In read-only channels, only channel admins, channel moderators and super admins can start one.
+- **Starting:** any member of the channel can start a call. In read-only channels, only channel admins, channel moderators and super admins can start one. To stop ring spam, each person can start a new call in the same channel at most once every 2 minutes.
 - **One call at a time:** a channel can only have one live call. If someone taps Call while a call is already running, they simply join it.
 - **Talking:** everyone on the call can talk. There is no raise-hand step.
 - **The person who started the call can end it for everyone**, whether or not they are an admin.
@@ -139,6 +139,7 @@ Errors come back with a status, a short code (such as `FORBIDDEN`) and a message
 
 | When | Error | What the app should do |
 |---|---|---|
+| Starting a call | Too many requests: "Please wait a moment before starting another call in this channel" | Show that message. Each person can start a new call in the same channel at most once every 2 minutes. Joining a call that's already running is never limited. |
 | Starting or checking a call | "Channel not found" | Show "Channel not found" and leave the screen. |
 | Starting or checking a call | "You are not a member of this channel" | Show that message. |
 | Starting a call in a read-only channel | "Only moderators can start calls in read-only channels" | Hide the call button for this user. |
@@ -200,6 +201,12 @@ If the heartbeat stops, the user will appear offline to everyone, even if the ap
 ### Showing online status and last seen (all users)
 
 - **Live changes:** listen for the `presence` event. It tells you a user's ID and their new status (online, away or offline). When the status is offline it also includes their last seen time. Update any green dots, chat headers and profiles showing that user.
+- **Only for people you're watching:** the server no longer sends everyone's status changes to everyone. It sends a user's changes only to apps that are watching that user:
+  - The people a user has DMs with are watched automatically when the app connects, so chat list dots work with no extra work.
+  - For anyone else on screen (a profile, a member list, a group chat header), send `presence:subscribe` with the list of user IDs being shown. The server replies straight away with their current statuses, then sends their changes as they happen.
+  - When those people are no longer on screen, send `presence:unsubscribe` with the same IDs.
+  - An app can watch up to 500 people at once; any beyond that are ignored.
+  - Watching resets when the socket reconnects: subscribe again for whatever is still on screen.
 - **User profile:** the profile response now includes the user's status and their `lastSeenAt` time.
 - **Chat list:** for each DM, the other person's details now include their status and `lastSeenAt` time.
 
@@ -233,17 +240,20 @@ The socket events only carry user IDs. To show names and avatars, fetch `GET /ap
 
 #### Errors
 - Non-super-admins calling the online users endpoint get a "forbidden" error. Don't show the online users screen to anyone else.
-- A user who is made super admin while signed in starts getting the live list after they reconnect with a refreshed token.
+- A user who is made super admin while signed in starts getting the live list straight away (a fresh snapshot arrives). A super admin who is demoted stops getting it straight away.
 
 ### Things to watch out for
 
 - **Several devices:** a user stays online as long as any of their devices is connected.
 - **Server problems:** if the presence store is briefly unavailable, users may show as offline for a moment. Don't show error messages for this; it sorts itself out.
+- **After a server deploy:** every app reconnects at about the same time. Keep the socket client's built-in random reconnect delay switched on so they don't all arrive in the same second. Users are not shown as offline during a deploy unless they fail to reconnect.
 - **Reconnecting:** after a super admin's socket reconnects, a new snapshot arrives. Replace the list and counter with it rather than adding to them.
 
 ### Testing checklist
 
 - Open the app on device A and view user B's profile on device C: B shows online.
+- User C has no DM with B but opens B's profile: B's status still updates live (the profile screen subscribes to B).
+- A member starts a call, ends it, and tries to start another within 2 minutes: they see "Please wait a moment…".
 - Put B's app in the background: B shows away.
 - Close B's app normally: B shows offline with a last seen time within a few seconds.
 - Kill B's app or turn off its internet: B shows offline within about 3 minutes, with last seen set to their last activity.

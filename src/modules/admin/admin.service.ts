@@ -2,7 +2,7 @@ import { prisma } from '../../infra/db';
 import { NotFound, Conflict, Forbidden } from '../../utils/errors';
 import { cached, cacheKeys, invalidate } from '../../infra/cache';
 import { joinChannelRooms } from '../../infra/realtime';
-import { getOnlineUsers } from '../chat/chat.socket';
+import { getOnlineUsers, refreshPresenceAdminAccess } from '../chat/chat.socket';
 import type { CreateBranchInput, CreateClusterInput, UpdateClusterInput } from './admin.schema';
 
 const BRANCH_SECTIONS = [
@@ -208,6 +208,7 @@ export const adminService = {
     const u = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
     if (!u) throw NotFound('User not found');
     await prisma.user.update({ where: { id: userId }, data: { globalRole: role } });
+    await refreshPresenceAdminAccess(userId, role === 'SUPER_ADMIN');
     return { ok: true };
   },
 
@@ -263,6 +264,7 @@ export const adminService = {
       cacheKeys.adminDashboard('global'),
       cacheKeys.adminDashboard(branchId),
       cacheKeys.adminAnalytics,
+      cacheKeys.userAdminScopes(userId),
       ...channelIds.flatMap((id) => [cacheKeys.channelMembers(id), cacheKeys.channelMeta(id)]),
     );
     joinChannelRooms(userId, channelIds);
@@ -298,6 +300,7 @@ export const adminService = {
       cacheKeys.clusters,
       cacheKeys.adminDashboard('global'),
       cacheKeys.adminAnalytics,
+      cacheKeys.userAdminScopes(userId),
       ...(channel ? [cacheKeys.channelMembers(channel.id), cacheKeys.channelMeta(channel.id)] : []),
     );
     if (channel) joinChannelRooms(userId, [channel.id]);

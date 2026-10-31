@@ -2,7 +2,7 @@ import { flushSentry } from './instrument';
 import http from 'http';
 import { createApp } from './app';
 import { createSocketServer } from './infra/socket';
-import { registerSocketHandlers } from './modules/chat/chat.socket';
+import { beginPresenceShutdown, registerSocketHandlers } from './modules/chat/chat.socket';
 import { setIo } from './infra/realtime';
 import { startWorkers } from './jobs';
 import { env } from './config/env';
@@ -34,6 +34,7 @@ server.listen(env.PORT, () => logger.info(`API + sockets on :${env.PORT}`));
 
 function shutdown(signal: string) {
   logger.info({ signal }, 'Shutting down HTTP server');
+  beginPresenceShutdown();
   server.close((err) => {
     if (err) {
       logger.error({ err }, 'HTTP server shutdown failed');

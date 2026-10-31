@@ -6,8 +6,9 @@ import { enqueue } from '../../infra/enqueue';
 import { pushService } from '../push/push.service';
 import { redis, withDeadline } from '../../infra/redis';
 import { logger } from '../../infra/logger';
-import { getBulkPresence } from '../chat/chat.socket';
-import { BadRequest, Forbidden, NotFound } from '../../utils/errors';
+import { readPresence } from '../chat/chat.socket';
+import { cached, cacheKeys } from '../../infra/cache';
+import { BadRequest, Forbidden, NotFound, TooManyRequests } from '../../utils/errors';
 import { canCreateForScope, canModerateScoped } from '../../utils/authorization';
 import { env } from '../../config/env';
 import type { CreateRoomInput, UpdateRoomInput } from './audio-rooms.schema';
@@ -28,6 +29,9 @@ const ROOM_SELECT = {
 } as const;
 
 const CHANNEL_CALL_RING_TTL_MS = 30_000;
+// Each new channel call rings (socket + push) every member, so one user may start at most one
+// new call per channel in this window. Joining a live call is never limited.
+const CHANNEL_CALL_START_COOLDOWN_S = 120;
 
 const CHANNEL_CALL_SELECT = {
   id: true,
@@ -130,6 +134,67 @@ async function canModerateRoom(
   return false;
 }
 
+// Branch-admin / cluster-mod scopes for the `viewer` flags on room detail. Cached briefly because
+// room detail is on the join hot path (Prayer Watch rings the whole org). The flags are a UI hint:
+// every moderation endpoint still re-checks live through canModerateRoom.
+function viewerAdminScopes(userId: string) {
+  return cached(cacheKeys.userAdminScopes(userId), 60, async () => {
+    const [branches, clusters] = await Promise.all([
+      prisma.branchMembership.findMany({ where: { userId, role: 'ADMIN' }, select: { branchId: true } }),
+      prisma.clusterMembership.findMany({ where: { userId, role: 'MODERATOR' }, select: { clusterId: true } }),
+    ]);
+    return { branchIds: branches.map((b) => b.branchId), clusterIds: clusters.map((c) => c.clusterId) };
+  });
+}
+
+// Same rules as canModerateRoom, evaluated from pre-fetched data (no queries).
+function viewerCanModerate(
+  userId: string,
+  role: string,
+  room: { hostId: string; branchId: string | null; clusterId: string | null; type: 'GENERAL' | 'PRAYER_WATCH' | 'CHANNEL_CALL' },
+  scopes: { branchIds: string[]; clusterIds: string[] },
+  channelRole: string | null,
+): boolean {
+  if (role === 'SUPER_ADMIN' || room.hostId === userId) return true;
+  if (room.branchId && scopes.branchIds.includes(room.branchId)) return true;
+  if (room.clusterId && scopes.clusterIds.includes(room.clusterId)) return true;
+  if (channelRole === 'ADMIN' || channelRole === 'MODERATOR') return true;
+  if (room.type === 'PRAYER_WATCH') return scopes.branchIds.length > 0 || scopes.clusterIds.length > 0;
+  return false;
+}
+
+// Adds a participant only while the room is LIVE. FOR SHARE lets concurrent joins run in parallel
+// but serialises against endIfEmpty/end (which lock the row for update), so a join can never land
+// in a room that is being closed, and closing never misses a join that just committed.
+export function addParticipantIfLive(roomId: string, userId: string, role: 'HOST' | 'SPEAKER' | 'LISTENER') {
+  return prisma.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<{ status: string }[]>`
+      SELECT "status" FROM "AudioRoom" WHERE "id" = ${roomId} FOR SHARE`;
+    if (!rows[0]) throw NotFound('Room not found');
+    if (rows[0].status !== 'LIVE') throw BadRequest('Room is not live');
+    return tx.audioRoomParticipant.create({ data: { roomId, userId, role }, select: PARTICIPANT_SELECT });
+  });
+}
+
+// Ends a LIVE room when nobody is left on it. Locks the row so the count can't race a join.
+// Returns true only for the caller that actually ended it (so 'ended' is emitted once).
+async function endIfEmpty(roomId: string): Promise<boolean> {
+  const ended = await prisma.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<{ status: string }[]>`
+      SELECT "status" FROM "AudioRoom" WHERE "id" = ${roomId} FOR UPDATE`;
+    if (rows[0]?.status !== 'LIVE') return false;
+    const remaining = await tx.audioRoomParticipant.count({ where: { roomId, leftAt: null } });
+    if (remaining > 0) return false;
+    await tx.audioRoom.update({ where: { id: roomId }, data: { status: 'ENDED', endedAt: new Date() } });
+    return true;
+  });
+  if (ended) {
+    emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
+    closeAudioRoom(roomId);
+  }
+  return ended;
+}
+
 async function isLastActiveParticipant(userId: string, roomId: string): Promise<boolean> {
   const active = await prisma.audioRoomParticipant.findMany({
     where: { roomId, leftAt: null },
@@ -209,7 +274,8 @@ export const audioRoomService = {
   },
 
   async startChannelCall(userId: string, role: string, channelId: string): Promise<unknown> {
-    const { channel } = await requireChannelCallStarter(userId, role, channelId);
+    const { channel, membership } = await requireChannelCallStarter(userId, role, channelId);
+    const known = { channelRole: membership?.role ?? null };
     const existing = await liveChannelCall(channelId);
     if (existing) {
       const p = await prisma.audioRoomParticipant.findFirst({
@@ -217,10 +283,16 @@ export const audioRoomService = {
         select: { id: true, role: true },
       });
       if (!p) {
-        const created = await prisma.audioRoomParticipant.create({
-          data: { roomId: existing.id, userId, role: 'SPEAKER' },
-          select: PARTICIPANT_SELECT,
-        });
+        let created;
+        try {
+          created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
+        } catch (err) {
+          // The call ended between the lookup and the join — start a fresh one instead.
+          if ((err as { message?: string }).message === 'Room is not live') {
+            return this.startChannelCall(userId, role, channelId);
+          }
+          throw err;
+        }
         joinAudioRoom(userId, existing.id);
         emitToAudioRoom(existing.id, 'audio-room:user-joined', withAgoraUid(created));
       } else if (p.role === 'LISTENER') {
@@ -231,9 +303,17 @@ export const audioRoomService = {
       }
       const token = this.issueToken(existing.id, userId, 'host');
       emitToUser(userId, 'audio-room:token', { roomId: existing.id, ...token });
-      const detail = await this.get(userId, existing.id, role);
+      const detail = await this.get(userId, existing.id, role, known);
       return { ...detail, agora: token, alreadyLive: true };
     }
+
+    // Fails open if Redis is unavailable: a missed limit is better than blocking calls.
+    const slot = await withDeadline(
+      redis.set(`call-start:${channelId}:${userId}`, '1', 'EX', CHANNEL_CALL_START_COOLDOWN_S, 'NX'),
+      500,
+      'OK' as const,
+    );
+    if (slot !== 'OK') throw TooManyRequests('Please wait a moment before starting another call in this channel');
 
     const channelName = channelDisplayName(channel);
     const starter = await prisma.user.findUnique({
@@ -287,7 +367,7 @@ export const audioRoomService = {
       { jobId: `channel-call-started-${room.id}` },
     );
 
-    const detail = await this.get(userId, room.id, role);
+    const detail = await this.get(userId, room.id, role, known);
     return { ...detail, agora: this.issueToken(room.id, userId, 'host'), alreadyLive: false };
   },
 
@@ -418,7 +498,8 @@ export const audioRoomService = {
   },
 
   // Room detail. All speakers (few), listeners capped at 30 + exact counts for the UI header.
-  async get(userId: string, roomId: string, role = 'MEMBER') {
+  // `known` lets callers that already verified channel membership skip re-checking it.
+  async get(userId: string, roomId: string, role = 'MEMBER', known?: { channelRole: string | null }) {
     const room = await prisma.audioRoom.findUnique({
       where: { id: roomId },
       select: {
@@ -433,9 +514,12 @@ export const audioRoomService = {
       },
     });
     if (!room) throw NotFound('Room not found');
-    if (room.channelId) await requireChannelMember(userId, role, room.channelId);
+    let channelRole = known?.channelRole ?? null;
+    if (room.channelId && !known) {
+      channelRole = (await requireChannelMember(userId, role, room.channelId)).membership?.role ?? null;
+    }
 
-    const [listeners, listenerCount, canModerate] = await Promise.all([
+    const [listeners, listenerCount, scopes] = await Promise.all([
       prisma.audioRoomParticipant.findMany({
         where: { roomId, leftAt: null, role: 'LISTENER' },
         select: PARTICIPANT_SELECT,
@@ -443,8 +527,9 @@ export const audioRoomService = {
         take: 30,
       }),
       prisma.audioRoomParticipant.count({ where: { roomId, leftAt: null, role: 'LISTENER' } }),
-      canModerateRoom(userId, role, room),
+      viewerAdminScopes(userId),
     ]);
+    const canModerate = viewerCanModerate(userId, role, room, scopes, channelRole);
 
     const { participants, reminders, type, ...rest } = room;
     const host = participants.find((p) => p.role === 'HOST')?.user ?? null;
@@ -520,11 +605,14 @@ export const audioRoomService = {
     if (!allowed) throw Forbidden('You do not have permission to end this room');
     if (room.status === 'ENDED') throw BadRequest('Room already ended');
 
-    const updated = await prisma.audioRoom.update({
-      where: { id: roomId },
+    // Conditional so two concurrent ends (or an end racing the last leave) end it exactly once.
+    // The UPDATE's row lock also makes a concurrent addParticipantIfLive wait and then see ENDED.
+    const { count } = await prisma.audioRoom.updateMany({
+      where: { id: roomId, status: { not: 'ENDED' } },
       data: { status: 'ENDED', endedAt: new Date() },
-      select: ROOM_SELECT,
     });
+    if (count === 0) throw BadRequest('Room already ended');
+    const updated = await prisma.audioRoom.findUniqueOrThrow({ where: { id: roomId }, select: ROOM_SELECT });
     await prisma.audioRoomParticipant.updateMany({
       where: { roomId, leftAt: null },
       data: { leftAt: new Date() },
@@ -551,7 +639,9 @@ export const audioRoomService = {
     ]);
     if (!room) throw NotFound('Room not found');
     if (room.status !== 'LIVE') throw BadRequest('Room is not live');
-    if (room.channelId) await requireChannelMember(userId, role, room.channelId);
+    const channelRole = room.channelId
+      ? ((await requireChannelMember(userId, role, room.channelId)).membership?.role ?? null)
+      : null;
     if (existing) throw BadRequest('Already in this room');
 
     // PRAYER_WATCH rooms are Telegram-style: everyone joins as SPEAKER (no LISTENER role at all,
@@ -567,15 +657,12 @@ export const audioRoomService = {
     }
     const agoraRole: 'host' | 'audience' = joinRole === 'LISTENER' ? 'audience' : 'host';
 
-    const participant = await prisma.audioRoomParticipant.create({
-      data: { roomId, userId, role: joinRole },
-      select: PARTICIPANT_SELECT,
-    });
+    const participant = await addParticipantIfLive(roomId, userId, joinRole);
 
     emitToAudioRoom(roomId, 'audio-room:user-joined', withAgoraUid(participant));
     joinAudioRoom(userId, roomId);
 
-    const detail = await this.get(userId, roomId, role);
+    const detail = await this.get(userId, roomId, role, { channelRole });
     return { ...detail, agora: this.issueToken(roomId, userId, agoraRole) };
   },
 
@@ -603,17 +690,7 @@ export const audioRoomService = {
     // The call stays live as long as anyone is on it — moderators come and go, participants
     // drift in and out. Auto-end fires ONLY when the last active participant leaves.
     if (room?.isPersistent) {
-      const remaining = await prisma.audioRoomParticipant.count({
-        where: { roomId, leftAt: null },
-      });
-      if (remaining === 0) {
-        await prisma.audioRoom.update({
-          where: { id: roomId },
-          data: { status: 'ENDED', endedAt: new Date() },
-        });
-        emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
-        closeAudioRoom(roomId);
-      }
+      await endIfEmpty(roomId);
       return { ok: true };
     }
 
@@ -953,7 +1030,13 @@ export const audioRoomService = {
     if (!participants.length) return { rooms: rooms.length, swept: 0, ended: 0 };
 
     const userIds = [...new Set(participants.map((p) => p.userId))];
-    const presence = await getBulkPresence(userIds);
+    // A slow read means presence is unknown — never treat that as "everyone offline", which would
+    // remove every participant and end the call.
+    const presence = await readPresence(userIds, 5000);
+    if (!presence) {
+      logger.warn({ rooms: rooms.length, participants: participants.length }, 'Phantom sweep skipped: presence read timed out');
+      return { skipped: 'presence-unavailable', rooms: rooms.length, swept: 0, ended: 0 };
+    }
     const stale = participants.filter((p) => presence[p.userId] === 'offline');
     if (!stale.length) return { rooms: rooms.length, swept: 0, ended: 0 };
 
@@ -971,18 +1054,7 @@ export const audioRoomService = {
     let ended = 0;
     const affectedRoomIds = [...new Set(stale.map((p) => p.roomId))];
     for (const roomId of affectedRoomIds) {
-      const remaining = await prisma.audioRoomParticipant.count({
-        where: { roomId, leftAt: null },
-      });
-      if (remaining === 0) {
-        await prisma.audioRoom.update({
-          where: { id: roomId },
-          data: { status: 'ENDED', endedAt: new Date() },
-        });
-        emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
-        closeAudioRoom(roomId);
-        ended += 1;
-      }
+      if (await endIfEmpty(roomId)) ended += 1;
     }
 
     logger.info({ rooms: rooms.length, swept: stale.length, ended }, 'Phantom participant sweep complete');
