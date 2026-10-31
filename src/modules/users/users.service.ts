@@ -163,8 +163,10 @@ export const userService = {
       return row;
     });
 
-    const [status, viewerChannels, targetChannels] = await Promise.all([
+    const [status, lastSeen, viewerChannels, targetChannels] = await Promise.all([
       getUserPresence(targetId),
+      // Outside the cached profile core: it changes every time the user goes offline.
+      prisma.user.findUnique({ where: { id: targetId }, select: { lastSeenAt: true } }),
       prisma.channelMembership.findMany({ where: { userId: viewerId }, select: { channelId: true } }),
       prisma.channelMembership.findMany({ where: { userId: targetId }, select: { channelId: true } }),
     ]);
@@ -178,7 +180,7 @@ export const userService = {
         })
       : [];
 
-    return { ...user, status, sharedChannels };
+    return { ...user, status, lastSeenAt: lastSeen?.lastSeenAt ?? null, sharedChannels };
   },
 
   // Self-delete (hard purge) — removes the account + its data and frees the email/phone for reuse.

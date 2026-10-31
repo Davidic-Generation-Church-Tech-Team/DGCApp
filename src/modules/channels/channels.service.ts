@@ -78,7 +78,7 @@ export const channelService = {
     const peers = dmIds.length
       ? await prisma.channelMembership.findMany({
           where: { channelId: { in: dmIds }, userId: { not: userId } },
-          select: { channelId: true, user: { select: { id: true, displayName: true, avatarUrl: true } } },
+          select: { channelId: true, user: { select: { id: true, displayName: true, avatarUrl: true, lastSeenAt: true } } },
         })
       : [];
     const peerMap = new Map(peers.map((p) => [p.channelId, p.user]));

@@ -6,6 +6,7 @@ import { workerOptions } from '../../infra/queue';
 import { captureJobException } from '../../instrument';
 import { eventService } from '../../modules/events/events.service';
 import { audioRoomService } from '../../modules/audio-rooms/audio-rooms.service';
+import { sweepExpiredPresence } from '../../modules/chat/chat.socket';
 import { callService } from '../../modules/calls/calls.service';
 import { notificationService } from '../../modules/notifications/notifications.service';
 import { pushService } from '../../modules/push/push.service';
@@ -101,6 +102,12 @@ export const notificationWorker = new Worker(
     if (job.name === 'audio-room-phantom-sweep') {
       const result = await audioRoomService.sweepPhantomParticipants();
       if (result.swept && result.swept > 0) logger.info({ jobId: job.id, ...result }, 'Phantom sweep swept participants');
+      return;
+    }
+
+    if (job.name === 'presence-sweep') {
+      const result = await sweepExpiredPresence();
+      if (result.swept > 0) logger.info({ jobId: job.id, ...result }, 'Presence sweep marked users offline');
       return;
     }
 

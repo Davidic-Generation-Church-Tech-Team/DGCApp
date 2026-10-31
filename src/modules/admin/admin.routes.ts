@@ -12,6 +12,7 @@ adminRouter.use(authenticate);
 
 adminRouter.get('/analytics', requireSuperAdmin, asyncHandler(adminController.analytics));
 adminRouter.get('/users', requireSuperAdmin, asyncHandler(adminController.listUsers));
+adminRouter.get('/online-users', requireSuperAdmin, asyncHandler(adminController.onlineUsers));
 adminRouter.post('/users/:userId/suspend', requireSuperAdmin, asyncHandler(adminController.suspend));
 adminRouter.post('/users/:userId/unsuspend', requireSuperAdmin, asyncHandler(adminController.unsuspend));
 adminRouter.post('/users/:userId/role', requireSuperAdmin, validate(setRoleSchema), asyncHandler(adminController.setRole));

@@ -9,6 +9,11 @@ export const adminController = {
     const search = typeof req.query.search === 'string' ? req.query.search : undefined;
     res.json(await adminService.listUsers(search));
   },
+  async onlineUsers(req: Request, res: Response) {
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    res.json(await adminService.onlineUsers(offset, limit));
+  },
   async suspend(req: Request, res: Response) {
     res.json(await adminService.setSuspended(req.params.userId as string, true));
   },

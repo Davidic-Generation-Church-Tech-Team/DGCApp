@@ -32,6 +32,12 @@ export function startWorkers() {
     .upsertJobScheduler('audio-room-phantom-sweep', { every: 3 * 60 * 1000 }, { name: 'audio-room-phantom-sweep' })
     .then(() => logger.info('Audio-room phantom-sweep scheduler registered'))
     .catch((err) => logger.error({ err }, 'Failed to register phantom-sweep scheduler'));
+  // Presence sweep: users whose heartbeat lapsed without a clean socket disconnect are marked
+  // offline (broadcast + lastSeenAt). With the 120s TTL, they show offline within ~3 minutes.
+  notificationQueue
+    .upsertJobScheduler('presence-sweep', { every: 60 * 1000 }, { name: 'presence-sweep' })
+    .then(() => logger.info('Presence-sweep scheduler registered'))
+    .catch((err) => logger.error({ err }, 'Failed to register presence-sweep scheduler'));
   // Daily janitor: wipes expired OTPs, aged notifications, and stale reminders.
   notificationQueue
     .upsertJobScheduler('janitor', { every: 24 * 60 * 60 * 1000 }, { name: 'janitor-scan' })

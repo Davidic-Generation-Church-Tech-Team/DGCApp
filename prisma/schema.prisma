@@ -230,6 +230,7 @@ model User {
   updatedAt   DateTime  @updatedAt
   onboardedAt DateTime? // stamped once when user first completes onboarding (name + branch)
   suspendedAt DateTime? // admin suspension (CLAUDE.md §13); null = active
+  lastSeenAt  DateTime? // stamped when the user goes offline (last socket closes or heartbeat lapses)
   deletedAt   DateTime? // soft delete
 
   // Relations (ownership — not audit fields)

@@ -4,9 +4,16 @@ import { prisma } from '../../infra/db';
 import { redis, withDeadline } from '../../infra/redis';
 import { logger } from '../../infra/logger';
 import { stableUid } from '../audio-rooms/audio-rooms.service';
+import { getIo } from '../../infra/realtime';
 
 const PRESENCE_TTL = 120; // seconds — refreshed every heartbeat; expires = offline
 const PRESENCE_KEY = (uid: string) => `presence:${uid}`;
+// Everyone currently online/away, scored by last heartbeat (ms). Lets admins list/count who is
+// online without scanning presence:* keys, and lets the sweep find users whose TTL lapsed.
+const ONLINE_SET = 'presence:online';
+// Super-admin sockets join this room for the live online list (snapshot + per-change updates).
+const PRESENCE_ADMIN_ROOM = 'presence:admins';
+const SNAPSHOT_LIMIT = 5000;
 
 type PresenceStatus = 'online' | 'away' | 'offline';
 
@@ -30,6 +37,76 @@ export async function getBulkPresence(userIds: string[]): Promise<Record<string,
   return out;
 }
 
+export async function getOnlineCount(): Promise<number> {
+  return withDeadline(redis.zcard(ONLINE_SET), 500, 0);
+}
+
+// Online/away users, most recently active first. `lastActiveAt` is the last heartbeat/connect.
+export async function getOnlineUsers(offset = 0, limit = 50) {
+  const [onlineCount, raw] = await Promise.all([
+    getOnlineCount(),
+    withDeadline(redis.zrevrange(ONLINE_SET, offset, offset + limit - 1, 'WITHSCORES'), 1000, [] as string[]),
+  ]);
+  const entries: { userId: string; lastActiveAt: Date }[] = [];
+  for (let i = 0; i < raw.length; i += 2) {
+    entries.push({ userId: raw[i]!, lastActiveAt: new Date(Number(raw[i + 1])) });
+  }
+  const statuses = await getBulkPresence(entries.map((e) => e.userId));
+  // A lapsed TTL reads as offline until the sweep removes it from the set — hide those rows.
+  const users = entries
+    .filter((e) => statuses[e.userId] !== 'offline')
+    .map((e) => ({ ...e, status: statuses[e.userId] as PresenceStatus }));
+  return { onlineCount, users, hasMore: offset + limit < onlineCount };
+}
+
+function notifyPresenceAdmins(userId: string, status: PresenceStatus, onlineCount: number, lastSeenAt?: Date) {
+  getIo()?.to(PRESENCE_ADMIN_ROOM).emit('presence:admin-update', {
+    userId,
+    status,
+    onlineCount,
+    ...(lastSeenAt ? { lastSeenAt } : {}),
+  });
+}
+
+// Single exit path to "offline": clears Redis, stamps User.lastSeenAt, and tells everyone.
+// Used by socket disconnect and by the sweep for users whose heartbeat TTL lapsed.
+async function markOffline(userId: string, lastSeenAt: Date) {
+  const results = await withDeadline(
+    redis.pipeline().del(PRESENCE_KEY(userId)).zrem(ONLINE_SET, userId).zcard(ONLINE_SET).exec(),
+    500,
+    null,
+  );
+  await prisma.user
+    .updateMany({ where: { id: userId }, data: { lastSeenAt } })
+    .catch((err) => logger.warn({ err, userId }, 'Failed to record lastSeenAt'));
+  if (!results) return;
+  // Only announce if they were actually visible as online/away (TTL may have expired already).
+  const wasVisible = Number(results[0]?.[1] ?? 0) > 0 || Number(results[1]?.[1] ?? 0) > 0;
+  if (!wasVisible) return;
+  getIo()?.emit('presence', { userId, status: 'offline', lastSeenAt });
+  notifyPresenceAdmins(userId, 'offline', Number(results[2]?.[1] ?? 0), lastSeenAt);
+}
+
+// Scheduled: users who stopped heart-beating without a clean disconnect (app killed, network
+// lost, server restart) never fire 'disconnect'. Their presence key expires silently — this
+// finds them via the online set, records last seen as their final heartbeat, and broadcasts.
+export async function sweepExpiredPresence() {
+  const ping = await withDeadline(redis.ping(), 500, null as string | null);
+  if (ping !== 'PONG') return { skipped: 'redis-unhealthy', swept: 0 };
+
+  const cutoff = Date.now() - PRESENCE_TTL * 1000;
+  const raw = await redis.zrangebyscore(ONLINE_SET, '-inf', cutoff, 'WITHSCORES');
+  let swept = 0;
+  for (let i = 0; i < raw.length; i += 2) {
+    const userId = raw[i]!;
+    // Heartbeat refreshes key and score together; a live key means the score write was lost.
+    if (await redis.exists(PRESENCE_KEY(userId))) continue;
+    await markOffline(userId, new Date(Number(raw[i + 1])));
+    swept += 1;
+  }
+  return { swept };
+}
+
 export function registerSocketHandlers(io: Server) {
   io.use((socket: Socket, next) => {
     const token = socket.handshake.auth?.['token'] as string | undefined;
@@ -46,13 +123,21 @@ export function registerSocketHandlers(io: Server) {
   // only on change — re-broadcasting every heartbeat is an O(users²) storm for zero information.
   async function setPresence(userId: string, status: PresenceStatus): Promise<boolean> {
     const results = await withDeadline(
-      redis.pipeline().get(PRESENCE_KEY(userId)).set(PRESENCE_KEY(userId), status, 'EX', PRESENCE_TTL).exec(),
+      redis
+        .pipeline()
+        .get(PRESENCE_KEY(userId))
+        .set(PRESENCE_KEY(userId), status, 'EX', PRESENCE_TTL)
+        .zadd(ONLINE_SET, Date.now(), userId)
+        .zcard(ONLINE_SET)
+        .exec(),
       500,
       null,
     );
     if (!results) return false; // Redis unreachable — skip the broadcast, don't stall the socket
     const previous = (results[0]?.[1] as string | null) ?? 'offline';
-    return previous !== status;
+    if (previous === status) return false;
+    notifyPresenceAdmins(userId, status, Number(results[3]?.[1] ?? 0));
+    return true;
   }
 
   io.on('connection', async (socket: Socket) => {
@@ -62,6 +147,12 @@ export function registerSocketHandlers(io: Server) {
     // --- Presence: mark online (broadcast only on an actual offline/away → online change) ---
     if (await setPresence(userId, 'online')) {
       socket.broadcast.emit('presence', { userId, status: 'online' });
+    }
+
+    // Super admins get the live online list: a snapshot now, then presence:admin-update deltas.
+    if (socket.data.user.role === 'SUPER_ADMIN') {
+      socket.join(PRESENCE_ADMIN_ROOM);
+      void getOnlineUsers(0, SNAPSHOT_LIMIT).then((snapshot) => socket.emit('presence:online-snapshot', snapshot));
     }
 
     // Fetch display name (for typing indicators) alongside channel/room memberships in one round.
@@ -177,11 +268,7 @@ export function registerSocketHandlers(io: Server) {
     socket.on('disconnect', async () => {
       // Check if user has other active sockets (multi-device)
       const rooms = await io.in(`user:${userId}`).fetchSockets();
-      if (rooms.length === 0) {
-        const deleted = await redis.del(PRESENCE_KEY(userId));
-        // Only announce if they were actually visible as online/away (TTL may have expired already).
-        if (deleted > 0) socket.broadcast.emit('presence', { userId, status: 'offline' });
-      }
+      if (rooms.length === 0) await markOffline(userId, new Date());
     });
   });
 

@@ -130,6 +130,15 @@ async function canModerateRoom(
   return false;
 }
 
+async function isLastActiveParticipant(userId: string, roomId: string): Promise<boolean> {
+  const active = await prisma.audioRoomParticipant.findMany({
+    where: { roomId, leftAt: null },
+    select: { userId: true },
+    take: 2,
+  });
+  return active.length === 1 && active[0]?.userId === userId;
+}
+
 async function requireChannelMember(userId: string, role: string, channelId: string) {
   const channel = await prisma.channel.findUnique({
     where: { id: channelId },
@@ -325,6 +334,7 @@ export const audioRoomService = {
       speakers: participants.map(withAgoraUid),
       listeners: [],
       isReminding: false,
+      viewer: { canModerate: true, canEnd: true }, // creator is the host
       agora: room.status === 'LIVE' ? this.issueToken(room.id, userId, 'host') : null,
     };
   },
@@ -413,6 +423,7 @@ export const audioRoomService = {
       where: { id: roomId },
       select: {
         ...ROOM_SELECT,
+        type: true,
         participants: {
           where: { leftAt: null, role: { in: ['HOST', 'SPEAKER'] } },
           select: PARTICIPANT_SELECT,
@@ -424,7 +435,7 @@ export const audioRoomService = {
     if (!room) throw NotFound('Room not found');
     if (room.channelId) await requireChannelMember(userId, role, room.channelId);
 
-    const [listeners, listenerCount] = await Promise.all([
+    const [listeners, listenerCount, canModerate] = await Promise.all([
       prisma.audioRoomParticipant.findMany({
         where: { roomId, leftAt: null, role: 'LISTENER' },
         select: PARTICIPANT_SELECT,
@@ -432,20 +443,30 @@ export const audioRoomService = {
         take: 30,
       }),
       prisma.audioRoomParticipant.count({ where: { roomId, leftAt: null, role: 'LISTENER' } }),
+      canModerateRoom(userId, role, room),
     ]);
 
-    const { participants, reminders, ...rest } = room;
+    const { participants, reminders, type, ...rest } = room;
     const host = participants.find((p) => p.role === 'HOST')?.user ?? null;
     const speakerCount = participants.length;
+    const totalParticipants = speakerCount + listenerCount;
+    // Mirrors the end() gate so clients don't have to re-derive who may end the call.
+    const isLastOnCall =
+      totalParticipants === 1 && (participants[0]?.userId ?? listeners[0]?.userId) === userId;
+    const isLive = room.status !== 'ENDED';
     return {
       ...rest,
       host,
       speakerCount,
       listenerCount,
-      totalParticipants: speakerCount + listenerCount,
+      totalParticipants,
       speakers: participants.map(withAgoraUid),
       listeners: listeners.map(withAgoraUid),
       isReminding: reminders.length > 0,
+      viewer: {
+        canModerate: isLive && canModerate,
+        canEnd: isLive && (canModerate || (type === 'CHANNEL_CALL' && isLastOnCall)),
+      },
     };
   },
 
@@ -491,7 +512,11 @@ export const audioRoomService = {
       select: { hostId: true, status: true, channelId: true, branchId: true, clusterId: true, type: true },
     });
     if (!room) throw NotFound('Room not found');
-    const allowed = await canModerateRoom(userId, role, room);
+    // Channel calls: whoever is the last one still on the call can end it, admin or not
+    // (same outcome as them leaving, just explicit).
+    const allowed =
+      (await canModerateRoom(userId, role, room)) ||
+      (room.type === 'CHANNEL_CALL' && (await isLastActiveParticipant(userId, roomId)));
     if (!allowed) throw Forbidden('You do not have permission to end this room');
     if (room.status === 'ENDED') throw BadRequest('Room already ended');
 

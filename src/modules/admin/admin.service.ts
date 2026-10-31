@@ -2,6 +2,7 @@ import { prisma } from '../../infra/db';
 import { NotFound, Conflict, Forbidden } from '../../utils/errors';
 import { cached, cacheKeys, invalidate } from '../../infra/cache';
 import { joinChannelRooms } from '../../infra/realtime';
+import { getOnlineUsers } from '../chat/chat.socket';
 import type { CreateBranchInput, CreateClusterInput, UpdateClusterInput } from './admin.schema';
 
 const BRANCH_SECTIONS = [
@@ -144,6 +145,26 @@ export const adminService = {
         signupMethods: { google: googleOnly, apple: appleOnly, both, passwordOrOtpOnly },
       };
     });
+  },
+
+  // Live "who's online" page: presence comes from Redis, profile fields from the DB.
+  async onlineUsers(offset = 0, limit = 50) {
+    const { onlineCount, users, hasMore } = await getOnlineUsers(offset, limit);
+    const rows = users.length
+      ? await prisma.user.findMany({
+          where: { id: { in: users.map((u) => u.userId) }, deletedAt: null },
+          select: { id: true, displayName: true, avatarUrl: true, globalRole: true },
+        })
+      : [];
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    return {
+      onlineCount,
+      items: users.flatMap((u) => {
+        const user = byId.get(u.userId);
+        return user ? [{ user, status: u.status, lastActiveAt: u.lastActiveAt }] : [];
+      }),
+      nextOffset: hasMore ? offset + limit : null,
+    };
   },
 
   async listUsers(search?: string, limit = 50) {
