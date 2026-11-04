@@ -35,6 +35,7 @@ function messagePushData(input: {
   channelName?: string;
   notificationType?: 'MESSAGE' | 'MENTION' | 'ANNOUNCEMENT';
   mentionEveryone?: boolean;
+  imageUrl?: string | null;
 }) {
   const canQuickReply = input.notificationType !== 'ANNOUNCEMENT';
   return {
@@ -50,6 +51,7 @@ function messagePushData(input: {
     ...(canQuickReply ? { quickReplyAction: 'MESSAGE_REPLY', notificationCategory: 'MESSAGE_REPLY' } : {}),
     ...(input.senderName ? { senderName: input.senderName } : {}),
     ...(input.channelName ? { channelName: input.channelName } : {}),
+    ...(input.imageUrl ? { imageUrl: input.imageUrl } : {}),
     ...(input.mentionEveryone !== undefined ? { mentionEveryone: input.mentionEveryone ? 'true' : 'false' } : {}),
   };
 }
@@ -291,19 +293,31 @@ export const notificationWorker = new Worker(
       return;
     }
 
-    // Announcement fan-out (§4/§12): one Notification row per channel member, batched so a 10k-member
-    // broadcast never blocks the request path. FCM push delivery will hook in here next.
+    // Announcement fan-out: one Notification row per active member, then a push.
+    // The poster is left out. A picture is the notification image; otherwise the body is a short excerpt.
     if (job.name === 'announcement-fanout') {
-      const { channelId, messageId, title, body, excludeUserId } = job.data as {
+      const { channelId, messageId, title, body, imageUrl, excludeUserId } = job.data as {
         channelId: string;
         messageId: string;
         title: string;
         body?: string | null;
+        imageUrl?: string | null;
         excludeUserId?: string;
       };
       const members = await prisma.channelMembership.findMany({
-        where: { channelId, mutedAt: null, ...(excludeUserId ? { userId: { not: excludeUserId } } : {}) },
+        where: {
+          channelId,
+          mutedAt: null,
+          user: { deletedAt: null, suspendedAt: null },
+          ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+        },
         select: { userId: true },
+      });
+      const data = messagePushData({
+        channelId,
+        messageId,
+        notificationType: 'ANNOUNCEMENT',
+        imageUrl,
       });
       let created = 0;
       for (let i = 0; i < members.length; i += BATCH) {
@@ -312,7 +326,7 @@ export const notificationWorker = new Worker(
           type: 'ANNOUNCEMENT' as const,
           title,
           body: body ?? null,
-          data: messagePushData({ channelId, messageId, notificationType: 'ANNOUNCEMENT' }),
+          data,
         }));
         const res = await prisma.notification.createMany({ data: chunk });
         created += res.count;
@@ -322,7 +336,8 @@ export const notificationWorker = new Worker(
         {
           title,
           body: body ?? null,
-          data: messagePushData({ channelId, messageId, notificationType: 'ANNOUNCEMENT' }),
+          imageUrl,
+          data,
           threadId: `channel:${channelId}`,
         },
       );

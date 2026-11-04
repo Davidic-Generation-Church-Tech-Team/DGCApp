@@ -977,8 +977,9 @@ registry.registerPath({
     'Response: attachments[] ({ id, url, type IMAGE/VIDEO/AUDIO/FILE, position, width, height }) ordered by position, ' +
     'plus mediaUrl = first attachment url and type = first attachment type (TEXT when there is no media). ' +
     'The GET feeds return the same shape. sender is always { id: "admin", displayName: "Admin", avatarUrl: null } — ' +
-    'the person who posted is not included. Every media URL must be a file in the DGC Cloudinary account with an ' +
-    'allowed extension (see GET /media/limits).',
+    'the person who posted is not included. Every other active member gets a push: the title and the first image ' +
+    'when the announcement has a photo, otherwise the title and the opening of the text. Every media URL must be a ' +
+    'file in the DGC Cloudinary account with an allowed extension (see GET /media/limits).',
   security: bearer,
   request: { body: json(postAnnouncementSchema) },
   responses: {
@@ -1026,7 +1027,7 @@ registry.registerPath({
   method: 'post',
   path: '/api/v1/branches/{branchId}/announcements',
   tags: ['announcements'],
-  summary: 'Post a branch announcement (branch admin or super admin) — notifies branch members',
+  summary: 'Post a branch announcement (branch admin or super admin) — notifies that branch, with the title and image or a text excerpt',
   description: 'Same body and response as POST /announcements, including attachments (albums) and mediaUrl.',
   security: bearer,
   request: { params: z.object({ branchId: z.string() }), body: json(postAnnouncementSchema) },

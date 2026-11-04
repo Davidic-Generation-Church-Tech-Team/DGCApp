@@ -6,6 +6,7 @@ import { Forbidden, NotFound } from '../../utils/errors';
 import type { PostAnnouncementInput } from './announcements.schema';
 import { inspectMediaUrl, type MediaKind } from '../media/media.limits';
 import { asAdminAuthor } from '../../utils/adminAuthor';
+import { announcementPushCopy } from './announcementPushCopy';
 
 // PRD §4/§3: official comms. The Global Announcement channel is org-wide; each branch's read-only
 // "Service Updates" section is its branch announcement channel. Both are posted only by super admins
@@ -77,11 +78,18 @@ async function broadcast(channelId: string, userId: string, input: PostAnnouncem
   });
   const shown = asAdminAuthor(message);
   emitToChannel(channelId, 'message:new', shown); // live for members currently connected
+  const push = announcementPushCopy({
+    title: input.title,
+    body: message.body,
+    imageUrl: attachments.find((item) => item.type === 'IMAGE')?.url ?? null,
+    fallback: pushPreview(attachments),
+  });
   enqueue(notificationQueue, 'announcement-fanout', {
     channelId,
     messageId: message.id,
-    title: input.title,
-    body: message.body ?? pushPreview(attachments),
+    title: push.title,
+    body: push.body,
+    imageUrl: push.imageUrl,
     excludeUserId: userId,
   });
   return shown;

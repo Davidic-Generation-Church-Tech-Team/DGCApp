@@ -7,6 +7,7 @@ type ApnsEnvironment = 'sandbox' | 'production';
 type ApnsPayload = {
   title: string;
   body?: string | null;
+  imageUrl?: string | null;
   data?: Record<string, string>;
   ttlMs?: number;
   category?: string;
@@ -81,13 +82,16 @@ function providerToken() {
 }
 
 function apnsPayload(p: ApnsPayload) {
+  const imageUrl = p.imageUrl && p.imageUrl.startsWith('https://') ? p.imageUrl : undefined;
   const aps: Record<string, unknown> = {
     alert: { title: p.title, ...(p.body ? { body: p.body } : {}) },
     sound: 'default',
   };
   if (p.category) aps.category = p.category;
   if (p.threadId) aps['thread-id'] = p.threadId;
-  return { ...(p.data ?? {}), aps };
+  // iOS only downloads a notification picture when the app's extension sees this flag.
+  if (imageUrl) aps['mutable-content'] = 1;
+  return { ...(p.data ?? {}), ...(imageUrl ? { imageUrl } : {}), aps };
 }
 
 function apnsExpiration(ttlMs?: number) {

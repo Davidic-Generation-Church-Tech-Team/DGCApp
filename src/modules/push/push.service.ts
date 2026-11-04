@@ -9,6 +9,7 @@ type Platform = 'ANDROID' | 'IOS' | 'WEB';
 type PushPayload = {
   title: string;
   body?: string | null;
+  imageUrl?: string | null;
   data?: Record<string, unknown>;
   category?: string;
   threadId?: string;
@@ -44,10 +45,15 @@ function toStringMap(data?: Record<string, unknown>): Record<string, string> {
   return out;
 }
 
+function httpsImage(url: string | null | undefined): string | undefined {
+  return url && url.startsWith('https://') ? url : undefined;
+}
+
 function pushData(p: PushPayload): Record<string, string> {
   return toStringMap({
     ...(p.category ? { notificationCategory: p.category } : {}),
     ...(p.threadId ? { threadId: p.threadId } : {}),
+    ...(httpsImage(p.imageUrl) ? { imageUrl: httpsImage(p.imageUrl) } : {}),
     ...p.data,
   });
 }
@@ -100,6 +106,7 @@ async function sendApnsRows(rows: StoredDeviceToken[], p: PushPayload, options: 
   const res = await sendApnsAlerts(tokens, {
     title: p.title,
     body: p.body,
+    imageUrl: p.imageUrl,
     data: pushData(p),
     ttlMs: options.ttlMs,
     category: options.category ?? p.category,
@@ -143,9 +150,10 @@ async function sendFcmRows(rows: StoredDeviceToken[], p: PushPayload) {
   const clickAction = androidClickAction(data, p);
   const channelId = defaultAndroidChannelId(data, p);
   const tag = androidTag(data, p);
+  const imageUrl = httpsImage(p.imageUrl);
   const res = await fcm().sendEachForMulticast({
     tokens,
-    notification: { title: p.title, ...(p.body ? { body: p.body } : {}) },
+    notification: { title: p.title, ...(p.body ? { body: p.body } : {}), ...(imageUrl ? { imageUrl } : {}) },
     data,
     android: {
       priority: 'high',
@@ -153,6 +161,7 @@ async function sendFcmRows(rows: StoredDeviceToken[], p: PushPayload) {
       notification: {
         title: p.title,
         ...(p.body ? { body: p.body } : {}),
+        ...(imageUrl ? { imageUrl } : {}),
         ...(channelId ? { channelId } : {}),
         ...(clickAction ? { clickAction } : {}),
         ...(tag ? { tag } : {}),
@@ -163,6 +172,7 @@ async function sendFcmRows(rows: StoredDeviceToken[], p: PushPayload) {
     },
     apns: {
       headers: { 'apns-push-type': 'alert', 'apns-priority': '10' },
+      ...(imageUrl ? { fcmOptions: { imageUrl } } : {}),
       payload: {
         aps: {
           alert: { title: p.title, ...(p.body ? { body: p.body } : {}) },
