@@ -9,6 +9,7 @@ import { logger } from '../../infra/logger';
 import { BadRequest, NotFound, Forbidden } from '../../utils/errors';
 import { optimizeImage, thumbUrl } from '../../utils/cloudinaryUrl';
 import { moderationService } from '../moderation/moderation.service';
+import { asAdminAuthor, isAnnouncementChannel } from '../../utils/adminAuthor';
 import type { SendMessageInput, ListMessagesInput } from './chat.schema';
 
 const POLL_SELECT = {
@@ -173,7 +174,7 @@ export const chatService = {
         channelService.requireMember(userId, role, channelId),
         prisma.channel.findUnique({
           where: { id: channelId },
-          select: { isReadOnly: true, type: true },
+          select: { isReadOnly: true, type: true, name: true },
         }),
       ]);
       if (!channel) throw NotFound('Channel not found');
@@ -192,7 +193,7 @@ export const chatService = {
       const existing = dto.clientMessageId
         ? await findExistingSentMessage(userId, channelId, messageId, dto.clientMessageId)
         : null;
-      if (existing) return { message: existing, channelType: channel.type, created: false };
+      if (existing) return { message: existing, channelType: channel.type, channelName: channel.name, created: false };
 
       try {
         // For POLL messages, create poll + message atomically so retries cannot orphan polls.
@@ -220,7 +221,7 @@ export const chatService = {
               select: MESSAGE_SELECT,
             });
           });
-          return { message, channelType: channel.type, created: true };
+          return { message, channelType: channel.type, channelName: channel.name, created: true };
         }
 
         // Store images as right-sized auto-format delivery URLs (originals stay in Cloudinary) so
@@ -241,17 +242,20 @@ export const chatService = {
           },
           select: MESSAGE_SELECT,
         });
-        return { message, channelType: channel.type, created: true };
+        return { message, channelType: channel.type, channelName: channel.name, created: true };
       } catch (err) {
         if (isUniqueConflict(err)) {
           const existingMessage = await findExistingSentMessage(userId, channelId, messageId, dto.clientMessageId);
-          if (existingMessage) return { message: existingMessage, channelType: channel.type, created: false };
+          if (existingMessage) return { message: existingMessage, channelType: channel.type, channelName: channel.name, created: false };
         }
         throw err;
       }
     });
 
-    const decorated = withThumb(result.message);
+    const shown = isAnnouncementChannel({ type: result.channelType, name: result.channelName })
+      ? asAdminAuthor(result.message)
+      : result.message;
+    const decorated = withThumb(shown);
     if (result.created) {
       emitToChannel(channelId, 'message:new', decorated);
 
@@ -259,7 +263,7 @@ export const chatService = {
       // fails, the socket delivery already happened; log and move on. This shaves 10-20ms off
       // the send round trip AND lets the socket emit reach the recipient sooner because we're
       // not holding a Redis connection ahead of it.
-      notifyMessageFanout(channelId, result.channelType, userId, result.message, dto);
+      notifyMessageFanout(channelId, result.channelType, userId, shown, dto);
     }
     return decorated;
   },
@@ -284,7 +288,7 @@ export const chatService = {
         take: opts.limit + 1,
         select: MESSAGE_SELECT,
       }),
-      prisma.channel.findUnique({ where: { id: channelId }, select: { type: true } }),
+      prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } }),
     ]);
     const hasMore = rows.length > opts.limit;
     const messages = rows.slice(0, opts.limit);
@@ -300,17 +304,26 @@ export const chatService = {
       });
       peerLastReadAt = peer?.lastReadAt ?? null;
     }
-    return { messages: messages.map(withThumb), nextCursor: hasMore && last ? encodeCursor(last) : null, peerLastReadAt };
+    const present = isAnnouncementChannel(channel) ? asAdminAuthor : <T,>(message: T) => message;
+    return {
+      messages: messages.map((message) => withThumb(present(message))),
+      nextCursor: hasMore && last ? encodeCursor(last) : null,
+      peerLastReadAt,
+    };
   },
 
   async getOne(userId: string, role: string, channelId: string, messageId: string) {
     await channelService.requireMember(userId, role, channelId);
-    const message = await prisma.message.findFirst({
-      where: { id: messageId, channelId, deletedAt: null },
-      select: MESSAGE_SELECT,
-    });
+    const [message, channel] = await Promise.all([
+      prisma.message.findFirst({
+        where: { id: messageId, channelId, deletedAt: null },
+        select: MESSAGE_SELECT,
+      }),
+      prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } }),
+    ]);
     if (!message) throw NotFound('Message not found');
-    return withThumb(message);
+    const shown = isAnnouncementChannel(channel) ? asAdminAuthor(message) : message;
+    return withThumb(shown);
   },
 
   async addReaction(userId: string, role: string, messageId: string, emoji: string) {
@@ -349,7 +362,8 @@ export const chatService = {
       select: MESSAGE_SELECT,
     });
     emitToChannel(msg.channelId, pinned ? 'message:pinned' : 'message:unpinned', { messageId });
-    return withThumb(message);
+    const channel = await prisma.channel.findUnique({ where: { id: msg.channelId }, select: { type: true, name: true } });
+    return withThumb(isAnnouncementChannel(channel) ? asAdminAuthor(message) : message);
   },
 
   async remove(userId: string, role: string, messageId: string) {
@@ -382,7 +396,8 @@ export const chatService = {
       data: { body, editedAt: new Date() },
       select: MESSAGE_SELECT,
     });
-    const decorated = withThumb(message);
+    const channel = await prisma.channel.findUnique({ where: { id: msg.channelId }, select: { type: true, name: true } });
+    const decorated = withThumb(isAnnouncementChannel(channel) ? asAdminAuthor(message) : message);
     emitToChannel(msg.channelId, 'message:edited', decorated);
     return decorated;
   },
@@ -412,7 +427,8 @@ export const chatService = {
       },
       select: MESSAGE_SELECT,
     });
-    const decorated = withThumb(message);
+    const channel = await prisma.channel.findUnique({ where: { id: targetChannelId }, select: { type: true, name: true } });
+    const decorated = withThumb(isAnnouncementChannel(channel) ? asAdminAuthor(message) : message);
     emitToChannel(targetChannelId, 'message:new', decorated);
     return decorated;
   },
@@ -434,7 +450,9 @@ export const chatService = {
       take: 30,
       select: MESSAGE_SELECT,
     });
-    return rows.map(withThumb);
+    const channel = await prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } });
+    const present = isAnnouncementChannel(channel) ? asAdminAuthor : <T,>(message: T) => message;
+    return rows.map((message) => withThumb(present(message)));
   },
 
   // Vote on a poll option. Respects allowMultiple — if false, moves the vote to the new option.

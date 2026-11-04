@@ -19,6 +19,13 @@ const EVENT_SELECT = {
   _count: { select: { rsvps: true } },
 };
 
+const REMINDER_BATCH = 1000;
+
+function forMembers<T extends { createdById: string }>(event: T) {
+  const { createdById: _createdById, ...rest } = event;
+  return { ...rest, postedBy: 'Admin' as const };
+}
+
 function eventPushData(eventId: string, startsAt: Date) {
   return {
     type: 'event',
@@ -31,6 +38,58 @@ function eventPushData(eventId: string, startsAt: Date) {
     startsAt: startsAt.toISOString(),
     deepLink: `dgc://events/${eventId}`,
   };
+}
+
+function eventReminderBody(startsAt: Date) {
+  const when = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Africa/Lagos',
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    hour: 'numeric',
+    minute: '2-digit',
+    hourCycle: 'h12',
+    timeZoneName: 'short',
+  }).format(startsAt);
+  return `Starts ${when}. Tap for details.`;
+}
+
+// Church-wide events reach every active member. A branch or cluster event reaches that
+// group. Someone who already said they are not coming is left out.
+async function reminderPage(
+  event: { id: string; branchId: string | null; clusterId: string | null },
+  cursor?: string,
+) {
+  const activeUser = {
+    deletedAt: null,
+    suspendedAt: null,
+    eventRsvps: { none: { eventId: event.id, status: 'NOT_GOING' as const } },
+  };
+  if (event.branchId) {
+    const rows = await prisma.branchMembership.findMany({
+      where: { branchId: event.branchId, ...(cursor ? { id: { gt: cursor } } : {}), user: activeUser },
+      orderBy: { id: 'asc' },
+      take: REMINDER_BATCH,
+      select: { id: true, userId: true },
+    });
+    return rows.map((row) => ({ cursor: row.id, userId: row.userId }));
+  }
+  if (event.clusterId) {
+    const rows = await prisma.clusterMembership.findMany({
+      where: { clusterId: event.clusterId, ...(cursor ? { id: { gt: cursor } } : {}), user: activeUser },
+      orderBy: { id: 'asc' },
+      take: REMINDER_BATCH,
+      select: { id: true, userId: true },
+    });
+    return rows.map((row) => ({ cursor: row.id, userId: row.userId }));
+  }
+  const rows = await prisma.user.findMany({
+    where: { ...activeUser, ...(cursor ? { id: { gt: cursor } } : {}) },
+    orderBy: { id: 'asc' },
+    take: REMINDER_BATCH,
+    select: { id: true },
+  });
+  return rows.map((row) => ({ cursor: row.id, userId: row.id }));
 }
 
 // Who may create / edit / delete an event of a given scope:
@@ -95,7 +154,7 @@ export const eventService = {
       select: { eventId: true, status: true },
     });
     const map = new Map(mine.map((r) => [r.eventId, r.status]));
-    return events.map((e) => ({ ...e, myRsvp: map.get(e.id) ?? null }));
+    return events.map((e) => ({ ...forMembers(e), myRsvp: map.get(e.id) ?? null }));
   },
 
   async get(userId: string, eventId: string) {
@@ -110,7 +169,7 @@ export const eventService = {
       where: { eventId_userId: { eventId, userId } },
       select: { status: true, checkedInAt: true },
     });
-    return { ...event, rsvpCounts, myRsvp: mine?.status ?? null, checkedInAt: mine?.checkedInAt ?? null };
+    return { ...forMembers(event), rsvpCounts, myRsvp: mine?.status ?? null, checkedInAt: mine?.checkedInAt ?? null };
   },
 
   async create(userId: string, role: string, dto: CreateEventInput) {
@@ -125,7 +184,7 @@ export const eventService = {
     }
     await assertCanManage(userId, role, dto.branchId, dto.clusterId);
 
-    return prisma.event.create({
+    const created = await prisma.event.create({
       data: {
         title: dto.title,
         description: dto.description ?? null,
@@ -138,17 +197,24 @@ export const eventService = {
       },
       select: EVENT_SELECT,
     });
+    return forMembers(created);
   },
 
   // Edit an event's details (scope stays fixed). Same authority as creating it.
   async update(userId: string, role: string, eventId: string, dto: UpdateEventInput) {
     const event = await prisma.event.findUnique({
       where: { id: eventId },
-      select: { id: true, branchId: true, clusterId: true },
+      select: { id: true, branchId: true, clusterId: true, startsAt: true },
     });
     if (!event) throw NotFound('Event not found');
     await assertCanManage(userId, role, event.branchId, event.clusterId);
-    return prisma.event.update({ where: { id: eventId }, data: dto, select: EVENT_SELECT });
+    const startsAtMoved = dto.startsAt != null && dto.startsAt.getTime() !== event.startsAt.getTime();
+    const updated = await prisma.event.update({
+      where: { id: eventId },
+      data: { ...dto, ...(startsAtMoved ? { reminderSentAt: null } : {}) },
+      select: EVENT_SELECT,
+    });
+    return forMembers(updated);
   },
 
   // Delete/cancel an event. RSVPs cascade away with it.
@@ -195,42 +261,58 @@ export const eventService = {
     return { ok: true, checkedInAt };
   },
 
-  // Runs on a schedule (via the notification worker): notify GOING/INTERESTED attendees of events
-  // starting within the window, once each (guarded by Event.reminderSentAt).
+  // Runs every 15 minutes. About a day before an event starts, remind the people it is for,
+  // once. Moving startsAt clears reminderSentAt so the new time can be reminded too.
   async sendDueEventReminders(windowMs = 24 * 60 * 60 * 1000) {
     const now = new Date();
     const windowEnd = new Date(now.getTime() + windowMs);
     const events = await prisma.event.findMany({
       where: { reminderSentAt: null, startsAt: { gt: now, lte: windowEnd } },
-      select: { id: true, title: true, startsAt: true },
+      select: { id: true, title: true, startsAt: true, branchId: true, clusterId: true },
     });
     let notified = 0;
     for (const ev of events) {
-      const rsvps = await prisma.eventRSVP.findMany({
-        where: { eventId: ev.id, status: { in: ['GOING', 'INTERESTED'] } },
-        select: { userId: true },
+      const claimed = await prisma.event.updateMany({
+        where: { id: ev.id, reminderSentAt: null },
+        data: { reminderSentAt: now },
       });
-      for (let i = 0; i < rsvps.length; i += 1000) {
-        const data = eventPushData(ev.id, ev.startsAt);
-        const res = await prisma.notification.createMany({
-          data: rsvps.slice(i, i + 1000).map((r) => ({
-            userId: r.userId,
-            type: 'EVENT' as const,
-            title: `Upcoming: ${ev.title}`,
-            body: 'Starts soon — tap for details.',
-            data,
-          })),
-        });
-        notified += res.count;
-      }
+      if (claimed.count !== 1) continue;
+
+      const title = ev.title;
+      const body = eventReminderBody(ev.startsAt);
       const data = eventPushData(ev.id, ev.startsAt);
-      await pushService.sendToUsers(rsvps.map((r) => r.userId), {
-        title: `Upcoming: ${ev.title}`,
-        body: 'Starts soon — tap for details.',
-        data,
-        threadId: `event:${ev.id}`,
-      });
-      await prisma.event.update({ where: { id: ev.id }, data: { reminderSentAt: new Date() } });
+      const before = notified;
+      try {
+        let cursor: string | undefined;
+        for (;;) {
+          const page = await reminderPage(ev, cursor);
+          if (!page.length) break;
+          const userIds = page.map((row) => row.userId);
+          const res = await prisma.notification.createMany({
+            data: userIds.map((userId) => ({
+              userId,
+              type: 'EVENT' as const,
+              title,
+              body,
+              data,
+            })),
+          });
+          notified += res.count;
+          await pushService.sendToUsers(userIds, {
+            title,
+            body,
+            data,
+            threadId: `event:${ev.id}`,
+          });
+          cursor = page[page.length - 1]!.cursor;
+          if (page.length < REMINDER_BATCH) break;
+        }
+      } catch (err) {
+        if (notified === before) {
+          await prisma.event.update({ where: { id: ev.id }, data: { reminderSentAt: null } }).catch(() => {});
+        }
+        throw err;
+      }
     }
     return { events: events.length, notified };
   },

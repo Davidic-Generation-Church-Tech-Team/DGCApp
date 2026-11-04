@@ -10,6 +10,8 @@ import { sweepExpiredPresence } from '../../modules/chat/chat.socket';
 import { callService } from '../../modules/calls/calls.service';
 import { notificationService } from '../../modules/notifications/notifications.service';
 import { pushService } from '../../modules/push/push.service';
+import { birthdayService } from '../../modules/birthdays/birthdays.service';
+import { audioRoomLivePush, channelCallPush, prayerWatchPush } from '../../modules/calls/callPushCopy';
 
 const BATCH = 1000;
 
@@ -82,6 +84,18 @@ function audioRoomPushData(roomId: string) {
 export const notificationWorker = new Worker(
   'notification',
   async (job) => {
+    if (job.name === 'birthday-scan') {
+      const result = await birthdayService.enqueueDueWishes();
+      if (result.queued > 0) logger.info({ jobId: job.id, ...result }, 'Birthday wishes queued');
+      return;
+    }
+
+    if (job.name === 'birthday-wish') {
+      const { userId, year } = job.data as { userId: string; year: number };
+      await birthdayService.sendWish(userId, year);
+      return;
+    }
+
     // Scheduled scan: send pre-event reminders to attendees (PRD §9).
     if (job.name === 'event-reminders-scan') {
       const result = await eventService.sendDueEventReminders();
@@ -170,9 +184,10 @@ export const notificationWorker = new Worker(
       const userIds = members.map((m) => m.userId);
       if (!userIds.length) return;
 
+      const named = channelCallPush(startedByName, channelName);
       const ringPayload = {
-        title: channelName,
-        body: `${startedByName} started a group call`,
+        title: named.title,
+        body: named.body,
         ttlMs,
         data: {
           type: 'call',
@@ -205,24 +220,47 @@ export const notificationWorker = new Worker(
       return;
     }
 
-    // Prayer Watch fan-out: page every registered user (not deleted, not suspended) and push
-    // "Prayer Watch is live — tap to join". Also drops a notification row so it appears in the
-    // in-app notification center. Batched at BATCH so a 100k-user org doesn't OOM.
+    // Prayer Watch fan-out: page every registered user (not deleted, not suspended). The push
+    // title is the person who started the call. Also drops a notification row so it appears in
+    // the in-app notification center. Batched at BATCH so a large church doesn't run out of memory.
     if (job.name === 'prayer-watch-live-fanout') {
-      const { roomId, title, startedById, channelId: queuedChannelId } = job.data as {
+      const {
+        roomId,
+        startedById,
+        startedByName,
+        startedByAvatarUrl,
+        channelId: queuedChannelId,
+      } = job.data as {
         roomId: string;
         title: string;
         startedById: string;
+        startedByName?: string;
+        startedByAvatarUrl?: string;
         channelId?: string;
       };
       const channelId = queuedChannelId ?? (await prisma.channel.findFirst({
         where: { type: 'GLOBAL_PRAYER_WATCH' },
         select: { id: true },
       }))?.id;
+      const starter = startedByName?.trim()
+        ? { name: startedByName.trim(), avatarUrl: startedByAvatarUrl ?? '' }
+        : await prisma.user.findUnique({
+            where: { id: startedById },
+            select: { displayName: true, avatarUrl: true },
+          }).then((user) => ({
+            name: user?.displayName?.trim() || 'Someone',
+            avatarUrl: user?.avatarUrl ?? '',
+          }));
+      const named = prayerWatchPush(starter.name);
       const payload = {
-        title: 'Prayer Watch is live',
-        body: `${title} — tap to join the ongoing prayer`,
-        data: prayerWatchPushData(roomId, channelId),
+        title: named.title,
+        body: named.body,
+        data: {
+          ...prayerWatchPushData(roomId, channelId),
+          callerId: startedById,
+          callerName: starter.name,
+          callerAvatarUrl: starter.avatarUrl,
+        },
       };
       let cursor: string | undefined;
       let notified = 0;
@@ -400,25 +438,46 @@ export const notificationWorker = new Worker(
     }
 
     if (job.name === 'audio-room-started') {
-      const { roomId, title, userIds } = job.data as {
+      const { roomId, title, userIds, hostId, hostName, hostAvatarUrl } = job.data as {
         roomId: string;
         title: string;
         userIds: string[];
+        hostId?: string;
+        hostName?: string;
+        hostAvatarUrl?: string;
       };
+      const host = hostName?.trim()
+        ? { name: hostName.trim(), avatarUrl: hostAvatarUrl ?? '' }
+        : hostId
+          ? await prisma.user.findUnique({
+              where: { id: hostId },
+              select: { displayName: true, avatarUrl: true },
+            }).then((user) => ({
+              name: user?.displayName?.trim() || 'Someone',
+              avatarUrl: user?.avatarUrl ?? '',
+            }))
+          : null;
+      const data = {
+        ...audioRoomPushData(roomId),
+        ...(host && hostId ? { callerId: hostId, callerName: host.name, callerAvatarUrl: host.avatarUrl } : {}),
+      };
+      const named = audioRoomLivePush(host?.name, title);
+      const pushTitle = named.title;
+      const pushBody = named.body;
       for (let i = 0; i < userIds.length; i += BATCH) {
         const chunk = userIds.slice(i, i + BATCH).map((userId) => ({
           userId,
           type: 'SYSTEM' as const,
-          title: 'Audio room is live',
-          body: title,
-          data: audioRoomPushData(roomId),
+          title: pushTitle,
+          body: pushBody,
+          data,
         }));
         await prisma.notification.createMany({ data: chunk });
       }
       await pushService.sendToUsers(userIds, {
-        title: 'Audio room is live',
-        body: title,
-        data: audioRoomPushData(roomId),
+        title: pushTitle,
+        body: pushBody,
+        data,
         threadId: `audio-room:${roomId}`,
       });
       logger.info({ jobId: job.id, roomId, notified: userIds.length }, 'Audio room start notification complete');

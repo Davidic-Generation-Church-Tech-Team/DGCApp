@@ -175,10 +175,21 @@ export const prayerWatchService = {
     // Fan out "Prayer Watch call is live" push to every registered user (worker pages the User
     // table). Fire-and-forget so a Redis blip or BullMQ validation error can't 500 the starter
     // — the room already exists, the enqueue is a side-effect.
+    const starter = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { displayName: true, avatarUrl: true },
+    });
     enqueue(
       notificationQueue,
       'prayer-watch-live-fanout',
-      { roomId: room.id, title: room.title, startedById: userId, channelId: channel.id },
+      {
+        roomId: room.id,
+        title: room.title,
+        startedById: userId,
+        startedByName: starter?.displayName?.trim() || 'Someone',
+        startedByAvatarUrl: starter?.avatarUrl ?? '',
+        channelId: channel.id,
+      },
       { jobId: `prayer-watch-live-${room.id}` },
     );
 

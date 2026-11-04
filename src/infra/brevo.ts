@@ -1,6 +1,6 @@
 import { BrevoClient } from '@getbrevo/brevo';
 import { env } from '../config/env';
-import { otpEmail, resetOtpEmail } from './emailTemplate';
+import { birthdayEmail, otpEmail, resetOtpEmail } from './emailTemplate';
 
 const client = new BrevoClient({ apiKey: env.BREVO_API_KEY });
 
@@ -20,4 +20,8 @@ export async function sendOtpEmail(to: string, code: string) {
 
 export async function sendResetOtpEmail(to: string, code: string) {
   await sendEmail(to, resetOtpEmail(code));
+}
+
+export async function sendBirthdayEmail(to: string, name: string, avatarUrl: string | null) {
+  await sendEmail(to, birthdayEmail(name, avatarUrl));
 }

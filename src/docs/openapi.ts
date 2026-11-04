@@ -687,7 +687,7 @@ registry.registerPath({
   method: 'get',
   path: '/api/v1/events',
   tags: ['events'],
-  summary: 'Upcoming events (global + my branches + my clusters) with my RSVP',
+  summary: 'Upcoming events (global + my branches + my clusters) with my RSVP. The poster is postedBy "Admin", not a person. About a day before, a push goes to that audience, except people who RSVP Not Going.',
   security: bearer,
   responses: { 200: { description: 'Events', ...json(z.array(z.object({}).passthrough())) } },
 });
@@ -732,7 +732,7 @@ registry.registerPath({
   method: 'patch',
   path: '/api/v1/events/{eventId}',
   tags: ['events'],
-  summary: 'Edit an event (super admin or the branch admin / cluster moderator who owns it); scope is fixed',
+  summary: 'Edit an event (super admin or the owning branch admin / cluster moderator); scope is fixed. Moving startsAt sends the day-before reminder again.',
   security: bearer,
   request: { params: z.object({ eventId: z.string() }), body: json(updateEventSchema) },
   responses: {
@@ -976,7 +976,8 @@ registry.registerPath({
     'you may instead send mediaUrl (older single-file form, still supported). Not both. body is optional when media is sent. ' +
     'Response: attachments[] ({ id, url, type IMAGE/VIDEO/AUDIO/FILE, position, width, height }) ordered by position, ' +
     'plus mediaUrl = first attachment url and type = first attachment type (TEXT when there is no media). ' +
-    'The GET feeds return the same shape. Every media URL must be a file in the DGC Cloudinary account with an ' +
+    'The GET feeds return the same shape. sender is always { id: "admin", displayName: "Admin", avatarUrl: null } — ' +
+    'the person who posted is not included. Every media URL must be a file in the DGC Cloudinary account with an ' +
     'allowed extension (see GET /media/limits).',
   security: bearer,
   request: { body: json(postAnnouncementSchema) },
@@ -1212,7 +1213,7 @@ registry.registerPath({
   method: 'post',
   path: '/api/v1/prayer-watch/start',
   tags: ['prayer-watch'],
-  summary: 'Any member starts the Global Prayer Watch call. Idempotent — if one is already live, attaches the caller (as LISTENER by default) and returns the existing room + Agora token. Fires a "Prayer Watch is live" push to every user only when a NEW call is created.',
+  summary: 'Any member starts the Global Prayer Watch call. Idempotent — if one is already live, attaches the caller and returns the existing room + Agora token. A new call pushes the starter\'s name to every user.',
   security: bearer,
   responses: {
     201: {
@@ -1498,7 +1499,7 @@ const apiDescription = [
   '**Flow:**',
   '1. Chat mount: `GET /api/v1/channels/:channelId/call` → `{ channelId, live }`. Show a join-call banner when `live` is not null.',
   '2. Start/tap join: `POST /api/v1/channels/:channelId/call/start`. Response includes full audio-room detail + `agora` + `alreadyLive`.',
-  '3. Incoming ring: listen for `audio-room:incoming` or handle FCM payloads where `notificationType=CALL`, `callKind=CHANNEL_AUDIO_ROOM`, `roomId`, `channelId`, `channelName`, and caller fields are present. Tap should open the channel call and join with `POST /api/v1/audio-rooms/:roomId/join` or the channel start endpoint.',
+  '3. Incoming ring: listen for `audio-room:incoming` or handle FCM payloads where `notificationType=CALL`, `callKind=CHANNEL_AUDIO_ROOM`, `roomId`, `channelId`, `channelName`, and caller fields are present. The notification title is the starter\'s name (`callerName`); `channelName` is the place. Tap should open the channel call and join with `POST /api/v1/audio-rooms/:roomId/join` or the channel start endpoint.',
   '',
   '### Global Prayer Watch (singleton channel + live prayer call)',
   '',
@@ -1508,7 +1509,7 @@ const apiDescription = [
   '- Any authenticated member can start a call (`POST /prayer-watch/start`). Only one active call at a time — a second Start attaches you to the existing call as a SPEAKER instead of creating a duplicate.',
   '- The call stays live even if the starter leaves. It auto-ends only when the **last** participant leaves.',
   '- The starter is HOST for the duration they\'re in the call. Prayer Warriors cluster moderators (and super admins) can moderate (mute/promote/kick) regardless of whether they started it, and can force-end via `POST /prayer-watch/:roomId/end`.',
-  '- On start, the server fan-outs a "Prayer Watch is live" FCM push to every non-deleted, non-suspended user. Payloads include `route=PRAYER_WATCH`, `screen=PRAYER_WATCH`, `clickAction=OPEN_PRAYER_WATCH`, `roomId`, `channelId`, and `deepLink=dgc://prayer-watch/rooms/{roomId}`.',
+  '- On start, the server fan-outs a push whose title is the starter\'s name and whose body is "Prayer Watch is live". Payloads include `callerId`, `callerName`, `callerAvatarUrl`, `route=PRAYER_WATCH`, `screen=PRAYER_WATCH`, `clickAction=OPEN_PRAYER_WATCH`, `roomId`, `channelId`, and `deepLink=dgc://prayer-watch/rooms/{roomId}`.',
   '',
   '**Flow:**',
   '1. Home mount: `GET /api/v1/prayer-watch` → response `{ channelId, live }`. Show a "Join Prayer Watch" banner when `live` is not null.',

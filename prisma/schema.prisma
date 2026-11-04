@@ -219,6 +219,7 @@ model User {
   phoneNumber String? @unique
   gender      Gender?
   dateOfBirth DateTime? // used for safeguarding / minor handling (CLAUDE.md §9.1)
+  lastBirthdayWishYear Int? // Africa/Lagos calendar year of the last birthday wish sent
   occupation  String?
   bio         String?
 
@@ -654,7 +655,7 @@ model Event {
   endsAt      DateTime?
   createdById String // scalar audit field
   createdAt   DateTime  @default(now())
-  reminderSentAt DateTime? // set once the pre-event reminder has gone out to attendees (PRD §9)
+  reminderSentAt DateTime? // set once the day-before reminder has gone out; cleared if startsAt moves
 
   branch  Branch?     @relation(fields: [branchId], references: [id], onDelete: SetNull)
   cluster Cluster?    @relation(fields: [clusterId], references: [id], onDelete: SetNull)

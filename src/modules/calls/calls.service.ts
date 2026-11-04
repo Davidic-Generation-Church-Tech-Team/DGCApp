@@ -10,6 +10,7 @@ import { pushService } from '../push/push.service';
 import { notificationService } from '../notifications/notifications.service';
 import { BadRequest, Conflict, Forbidden, NotFound } from '../../utils/errors';
 import type { InitiateCallInput, ListCallsInput } from './calls.schema';
+import { directCallPush } from './callPushCopy';
 
 export const CALL_RING_TIMEOUT_MS = 30_000;
 
@@ -368,9 +369,10 @@ export const callService = {
   async sendIncomingPush(callId: string) {
     const call = await prisma.call.findUnique({ where: { id: callId }, select: CALL_SELECT });
     if (!call || call.status !== 'RINGING') return { ok: false, skipped: true };
+    const named = directCallPush(displayName(call.caller), call.type);
     await pushService.sendIncomingCallToUser(call.calleeId, {
-      title: displayName(call.caller),
-      body: `Incoming ${mediaLabel(call.type)} call`,
+      title: named.title,
+      body: named.body,
       data: callData(call, 'incoming'),
       ttlMs: Math.max(1_000, ringingExpiresAt(call).getTime() - Date.now()),
     });

@@ -13,7 +13,7 @@
     "prisma:studio": "prisma studio",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "test": "vitest"
+    "test": "vitest run"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

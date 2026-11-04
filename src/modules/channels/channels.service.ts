@@ -5,6 +5,7 @@ import { getBulkPresence } from '../chat/chat.socket';
 import { cached, cacheKeys } from '../../infra/cache';
 import { thumbUrl } from '../../utils/cloudinaryUrl';
 import { joinChannelRoom } from '../../infra/realtime';
+import { asAdminAuthor, isAnnouncementChannel } from '../../utils/adminAuthor';
 
 const CHANNEL_SELECT = {
   id: true,
@@ -16,6 +17,14 @@ const CHANNEL_SELECT = {
   clusterId: true,
   createdAt: true,
 } as const;
+
+function presentLastMessage<T extends { senderId: string; senderName: string | null }>(
+  channel: { type: string; name: string | null },
+  last: T | null,
+) {
+  if (!last || !isAnnouncementChannel(channel)) return last;
+  return { ...last, senderId: 'admin', senderName: 'Admin' };
+}
 
 export const channelService = {
   // Membership gate reused across chat ops. SUPER_ADMIN bypasses (can read/moderate any channel).
@@ -100,7 +109,7 @@ export const channelService = {
         role: m.role,
         lastReadAt: m.lastReadAt,
         unreadCount: unreadMap.get(ch.id) ?? 0,
-        lastMessage: lastMap.get(ch.id) ?? null,
+        lastMessage: presentLastMessage(ch, lastMap.get(ch.id) ?? null),
         peer: peer ? { ...peer, status: peerPresence[peer.id] ?? 'offline' } : null,
       };
     });
@@ -240,7 +249,9 @@ export const channelService = {
         sender: { select: { id: true, displayName: true, avatarUrl: true } },
       },
     });
-    return rows.map((m) => ({ ...m, thumbUrl: thumbUrl(m.mediaUrl, m.type) }));
+    const channel = await prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } });
+    const present = isAnnouncementChannel(channel) ? asAdminAuthor : <T,>(message: T) => message;
+    return rows.map((m) => ({ ...present(m), thumbUrl: thumbUrl(m.mediaUrl, m.type) }));
   },
 
   async sharedMedia(userId: string, role: string, channelId: string, cursor?: string, limit = 30) {
@@ -262,8 +273,10 @@ export const channelService = {
         sender: { select: { id: true, displayName: true } },
       },
     });
+    const channel = await prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } });
+    const present = isAnnouncementChannel(channel) ? asAdminAuthor : <T,>(message: T) => message;
     return {
-      items: items.map((m) => ({ ...m, thumbUrl: thumbUrl(m.mediaUrl, m.type) })),
+      items: items.map((m) => ({ ...present(m), thumbUrl: thumbUrl(m.mediaUrl, m.type) })),
       nextCursor: items.length === limit ? items[items.length - 1]!.createdAt.toISOString() : null,
     };
   },

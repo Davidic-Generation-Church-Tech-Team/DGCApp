@@ -9,8 +9,9 @@ const BANNER_URL =
 const WEBSITE = 'https://www.davidicgenerationchurch.com';
 const PURPLE = '#5B2A86';
 
-export function renderEmailLayout(opts: { preheader: string; contentHtml: string }): string {
+export function renderEmailLayout(opts: { preheader: string; contentHtml: string; reason?: string; extraHtml?: string }): string {
   const year = new Date().getFullYear();
+  const reason = opts.reason ?? "You received this because a sign-in code was requested for this email address. If that wasn't you, you can safely ignore it.";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -28,11 +29,12 @@ export function renderEmailLayout(opts: { preheader: string; contentHtml: string
         <img src="${BANNER_URL}" width="600" alt="Davidic Generation Church" style="display:block;width:100%;max-width:600px;height:auto;border:0;outline:none;text-decoration:none;">
       </td></tr>
       <tr><td style="height:4px;background-color:${PURPLE};font-size:0;line-height:0;">&nbsp;</td></tr>
+      ${opts.extraHtml ?? ''}
       <tr><td style="padding:36px 40px 8px 40px;font-family:Arial,Helvetica,sans-serif;">${opts.contentHtml}</td></tr>
       <tr><td style="padding:24px 40px 32px 40px;font-family:Arial,Helvetica,sans-serif;border-top:1px solid #eeeeee;">
         <p style="margin:0;color:#9ca3af;font-size:12px;line-height:18px;">
           Davidic Generation Church &middot; <a href="${WEBSITE}" style="color:${PURPLE};text-decoration:none;">davidicgenerationchurch.com</a><br>
-          You received this because a sign-in code was requested for this email address. If that wasn't you, you can safely ignore it.
+          ${reason}
         </p>
         <p style="margin:12px 0 0 0;color:#cbd5e1;font-size:12px;">&copy; ${year} Davidic Generation Church. All rights reserved.</p>
       </td></tr>
@@ -86,5 +88,42 @@ export function resetOtpEmail(code: string): { subject: string; html: string; te
     subject: 'Reset your DGC password',
     html: renderEmailLayout({ preheader: `Your DGC password reset code is ${code} (expires in 10 minutes).`, contentHtml }),
     text: `Your DGC password reset code is ${code}. It expires in 10 minutes.\n\nEnter this code in the app to set a new password.\n\nIf you didn't request this, you can safely ignore this email — your password has not been changed.\n\n— Davidic Generation Church\ndavidicgenerationchurch.com`,
+  };
+}
+
+// Keep this as a GIF. f_auto would turn it into a still picture and the confetti would stop.
+const CONFETTI_URL = 'https://res.cloudinary.com/ph82hmab/image/upload/v1793812481/dgc/email/birthday-confetti.gif';
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+export function birthdayEmail(name: string, avatarUrl: string | null): { subject: string; html: string; text: string } {
+  const safeName = escapeHtml(name);
+  const initial = escapeHtml((name.trim().slice(0, 1) || 'F').toUpperCase());
+  const photo = avatarUrl && /^https:\/\//i.test(avatarUrl)
+    ? `<img src="${escapeHtml(avatarUrl)}" width="96" height="96" alt="${safeName}" style="display:block;width:96px;height:96px;border-radius:48px;border:0;outline:none;object-fit:cover;">`
+    : `<div style="width:96px;height:96px;line-height:96px;border-radius:48px;background-color:${PURPLE};color:#ffffff;font-size:40px;font-weight:bold;text-align:center;">${initial}</div>`;
+  const contentHtml = `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr><td align="center" style="padding:0 0 18px 0;">${photo}</td></tr>
+    </table>
+    <h1 style="margin:0 0 12px 0;color:#1f2937;font-size:26px;font-weight:bold;text-align:center;">Happy birthday, ${safeName}</h1>
+    <p style="margin:0 0 16px 0;color:#4b5563;font-size:16px;line-height:24px;text-align:center;">Today we thank God for your life. May this new year bring you joy, peace, and sweet surprises.</p>
+    <p style="margin:0;color:#5B2A86;font-size:16px;line-height:24px;text-align:center;font-weight:bold;">You are loved at Davidic Generation Church.</p>`;
+  const text = `Happy birthday, ${name}\n\nToday we thank God for your life. May this new year bring you joy, peace, and sweet surprises.\n\nYou are loved at Davidic Generation Church.\n\n— Davidic Generation Church\ndavidicgenerationchurch.com`;
+  return {
+    subject: `Happy birthday, ${name}`,
+    html: renderEmailLayout({
+      preheader: `Happy birthday, ${safeName}. You are loved at DGC.`,
+      extraHtml: `<tr><td style="padding:0;background-color:#fff8fb;"><img src="${CONFETTI_URL}" width="600" alt="" style="display:block;width:100%;max-width:600px;height:auto;border:0;"></td></tr>`,
+      contentHtml,
+      reason: 'You received this because your birthday is saved on your DGC profile.',
+    }),
+    text,
   };
 }

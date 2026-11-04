@@ -5,6 +5,7 @@ import { emitToChannel, joinChannelRoom } from '../../infra/realtime';
 import { Forbidden, NotFound } from '../../utils/errors';
 import type { PostAnnouncementInput } from './announcements.schema';
 import { inspectMediaUrl, type MediaKind } from '../media/media.limits';
+import { asAdminAuthor } from '../../utils/adminAuthor';
 
 // PRD §4/§3: official comms. The Global Announcement channel is org-wide; each branch's read-only
 // "Service Updates" section is its branch announcement channel. Both are posted only by super admins
@@ -74,7 +75,8 @@ async function broadcast(channelId: string, userId: string, input: PostAnnouncem
     },
     select: ANNOUNCEMENT_SELECT,
   });
-  emitToChannel(channelId, 'message:new', message); // live for members currently connected
+  const shown = asAdminAuthor(message);
+  emitToChannel(channelId, 'message:new', shown); // live for members currently connected
   enqueue(notificationQueue, 'announcement-fanout', {
     channelId,
     messageId: message.id,
@@ -82,16 +84,17 @@ async function broadcast(channelId: string, userId: string, input: PostAnnouncem
     body: message.body ?? pushPreview(attachments),
     excludeUserId: userId,
   });
-  return message;
+  return shown;
 }
 
-function listChannel(channelId: string) {
-  return prisma.message.findMany({
+async function listChannel(channelId: string) {
+  const rows = await prisma.message.findMany({
     where: { channelId, deletedAt: null },
     orderBy: { createdAt: 'desc' },
     take: 30,
     select: ANNOUNCEMENT_SELECT,
   });
+  return rows.map(asAdminAuthor);
 }
 
 export const announcementService = {

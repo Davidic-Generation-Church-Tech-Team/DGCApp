@@ -937,7 +937,18 @@ export const audioRoomService = {
 
     userIds.delete(hostId);
     if (userIds.size) {
-      enqueue(notificationQueue, 'audio-room-started', { roomId, title, userIds: [...userIds] });
+      const host = await prisma.user.findUnique({
+        where: { id: hostId },
+        select: { displayName: true, avatarUrl: true },
+      });
+      enqueue(notificationQueue, 'audio-room-started', {
+        roomId,
+        title,
+        hostId,
+        hostName: host?.displayName?.trim() || 'Someone',
+        hostAvatarUrl: host?.avatarUrl ?? '',
+        userIds: [...userIds],
+      });
     }
     // Reminders are one-shot — clear them once fired.
     if (reminders.length) await prisma.audioRoomReminder.deleteMany({ where: { roomId } });

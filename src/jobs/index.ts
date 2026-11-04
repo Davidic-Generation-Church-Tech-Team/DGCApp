@@ -38,6 +38,15 @@ export function startWorkers() {
     .upsertJobScheduler('presence-sweep', { every: 60 * 1000 }, { name: 'presence-sweep' })
     .then(() => logger.info('Presence-sweep scheduler registered'))
     .catch((err) => logger.error({ err }, 'Failed to register presence-sweep scheduler'));
+  // Birthday wishes: every hour from 7am to 8pm in Lagos. Each person is wished once that year.
+  notificationQueue
+    .upsertJobScheduler(
+      'birthday-wishes',
+      { pattern: '5 7-20 * * *', tz: 'Africa/Lagos' },
+      { name: 'birthday-scan' },
+    )
+    .then(() => logger.info('Birthday-wish scheduler registered'))
+    .catch((err) => logger.error({ err }, 'Failed to register birthday-wish scheduler'));
   // Daily janitor: wipes expired OTPs, aged notifications, and stale reminders.
   notificationQueue
     .upsertJobScheduler('janitor', { every: 24 * 60 * 60 * 1000 }, { name: 'janitor-scan' })
