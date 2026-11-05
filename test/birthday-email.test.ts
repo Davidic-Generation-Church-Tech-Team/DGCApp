@@ -10,6 +10,9 @@ describe('birthday email', () => {
     expect(email.html).toContain('/dgc/email/birthday-confetti.gif');
     expect(email.html).not.toContain('f_auto/dgc/email/birthday-confetti.gif');
     expect(email.text).toContain('You are loved at Davidic Generation Church.');
+    expect(email.html).not.toContain('You received this because your birthday is saved on your DGC profile.');
+    expect(email.html).not.toContain('sign-in code was requested');
+    expect(email.html).toContain('davidicgenerationchurch.com');
   });
 
   it('uses an initial when there is no https photo, and escapes the name', () => {

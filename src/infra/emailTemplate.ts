@@ -9,9 +9,13 @@ const BANNER_URL =
 const WEBSITE = 'https://www.davidicgenerationchurch.com';
 const PURPLE = '#5B2A86';
 
-export function renderEmailLayout(opts: { preheader: string; contentHtml: string; reason?: string; extraHtml?: string }): string {
+export function renderEmailLayout(opts: { preheader: string; contentHtml: string; reason?: string | null; extraHtml?: string }): string {
   const year = new Date().getFullYear();
-  const reason = opts.reason ?? "You received this because a sign-in code was requested for this email address. If that wasn't you, you can safely ignore it.";
+  // Undefined keeps the sign-in footer. Null leaves that line off, which the birthday email uses.
+  const reason = opts.reason === undefined
+    ? "You received this because a sign-in code was requested for this email address. If that wasn't you, you can safely ignore it."
+    : opts.reason;
+  const reasonLine = reason ? `<br>\n          ${reason}` : '';
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -33,8 +37,7 @@ export function renderEmailLayout(opts: { preheader: string; contentHtml: string
       <tr><td style="padding:36px 40px 8px 40px;font-family:Arial,Helvetica,sans-serif;">${opts.contentHtml}</td></tr>
       <tr><td style="padding:24px 40px 32px 40px;font-family:Arial,Helvetica,sans-serif;border-top:1px solid #eeeeee;">
         <p style="margin:0;color:#9ca3af;font-size:12px;line-height:18px;">
-          Davidic Generation Church &middot; <a href="${WEBSITE}" style="color:${PURPLE};text-decoration:none;">davidicgenerationchurch.com</a><br>
-          ${reason}
+          Davidic Generation Church &middot; <a href="${WEBSITE}" style="color:${PURPLE};text-decoration:none;">davidicgenerationchurch.com</a>${reasonLine}
         </p>
         <p style="margin:12px 0 0 0;color:#cbd5e1;font-size:12px;">&copy; ${year} Davidic Generation Church. All rights reserved.</p>
       </td></tr>
@@ -122,7 +125,7 @@ export function birthdayEmail(name: string, avatarUrl: string | null): { subject
       preheader: `Happy birthday, ${safeName}. You are loved at DGC.`,
       extraHtml: `<tr><td style="padding:0;background-color:#fff8fb;"><img src="${CONFETTI_URL}" width="600" alt="" style="display:block;width:100%;max-width:600px;height:auto;border:0;"></td></tr>`,
       contentHtml,
-      reason: 'You received this because your birthday is saved on your DGC profile.',
+      reason: null,
     }),
     text,
   };
