@@ -213,6 +213,7 @@ Frontend behavior:
 - Leave Agora.
 - Close active/ringing call UI.
 - Both users receive `call:ended`.
+- If the caller cancels while the call is still ringing, the server also drops the incoming push when it has not gone out yet. Close the incoming screen on `call:ended` even if a push arrives a moment later. Do not start the call again.
 
 Possible final statuses:
 

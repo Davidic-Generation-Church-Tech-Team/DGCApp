@@ -17,6 +17,11 @@ export function emitToChannel(channelId: string, event: string, data: unknown) {
   io?.to(channelRoomName(channelId)).emit(event, data);
 }
 
+// The person who started a channel call is already in it. They must not be rung by their own start.
+export function emitToChannelExcept(channelId: string, exceptUserId: string, event: string, data: unknown) {
+  io?.to(channelRoomName(channelId)).except(`user:${exceptUserId}`).emit(event, data);
+}
+
 export function emitToUser(userId: string, event: string, data: unknown) {
   io?.to(`user:${userId}`).emit(event, data);
 }
@@ -53,4 +58,14 @@ export function leaveAudioRoom(userId: string, roomId: string) {
 
 export function closeAudioRoom(roomId: string) {
   io?.in(audioRoomName(roomId)).socketsLeave(audioRoomName(roomId));
+}
+
+// People on the call, and members who are only ringing in the channel, both need to hear this.
+// A socket that is already on the call is in both rooms, so the channel emit skips that room.
+export function emitCallEnded(roomId: string, channelId: string | null) {
+  const payload = { roomId, ...(channelId ? { channelId } : {}) };
+  const callRoom = audioRoomName(roomId);
+  if (channelId) io?.to(channelRoomName(channelId)).except(callRoom).emit('audio-room:ended', payload);
+  io?.to(callRoom).emit('audio-room:ended', payload);
+  closeAudioRoom(roomId);
 }

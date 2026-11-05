@@ -21,3 +21,11 @@ export function enqueue(queue: Queue, name: string, data: unknown, opts?: JobsOp
     .add(name, data as object, { ...DEFAULT_OPTS, ...opts })
     .catch((err) => logger.warn({ err, queue: queue.name, name, jobId: opts?.jobId }, 'enqueue failed'));
 }
+
+// Best-effort. An active worker ignores the remove and must notice the call is no longer live.
+export function dropJob(queue: Queue, jobId: string): void {
+  queue
+    .getJob(jobId)
+    .then((job) => job?.remove())
+    .catch((err) => logger.warn({ err, queue: queue.name, jobId }, 'could not drop queued job'));
+}

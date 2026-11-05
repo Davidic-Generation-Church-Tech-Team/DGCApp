@@ -15,6 +15,18 @@ import { audioRoomLivePush, channelCallPush, prayerWatchPush } from '../../modul
 
 const BATCH = 1000;
 
+// A ring that is still paging must stop once the call is over, or phones keep being called.
+async function roomStillLive(roomId: string, expect?: { type?: string; channelId?: string }) {
+  const room = await prisma.audioRoom.findUnique({
+    where: { id: roomId },
+    select: { status: true, type: true, channelId: true },
+  });
+  if (!room || room.status !== 'LIVE') return false;
+  if (expect?.type && room.type !== expect.type) return false;
+  if (expect?.channelId && room.channelId !== expect.channelId) return false;
+  return true;
+}
+
 function channelDisplayName(channel: {
   type: string;
   name: string | null;
@@ -98,10 +110,31 @@ export const notificationWorker = new Worker(
       return;
     }
 
-    // Scheduled scan: send pre-event reminders to attendees (PRD §9).
+    // Scheduled scan: send pre-event reminders to people who RSVP'd Going or Interested.
     if (job.name === 'event-reminders-scan') {
       const result = await eventService.sendDueEventReminders();
       logger.info({ jobId: job.id, ...result }, 'Event reminders processed');
+      return;
+    }
+
+    if (job.name === 'event-created') {
+      const data = job.data as {
+        eventId: string;
+        title: string;
+        body?: string | null;
+        imageUrl?: string | null;
+        startsAt: string;
+        branchId?: string | null;
+        clusterId?: string | null;
+        excludeUserId?: string;
+        cursor?: string;
+      };
+      // Save the last finished page on the job. A retry then continues instead of
+      // sending the earlier pages again.
+      const result = await eventService.notifyEventCreated(data, async (cursor) => {
+        await job.updateData({ ...job.data, cursor });
+      });
+      logger.info({ jobId: job.id, ...result }, 'Event create fan-out complete');
       return;
     }
 
@@ -168,11 +201,7 @@ export const notificationWorker = new Worker(
       const ttlMs = expiresAt.getTime() - Date.now();
       if (Number.isNaN(startedAtMs) || ttlMs <= 0) return;
 
-      const room = await prisma.audioRoom.findUnique({
-        where: { id: roomId },
-        select: { status: true, channelId: true, type: true },
-      });
-      if (!room || room.status !== 'LIVE' || room.type !== 'CHANNEL_CALL' || room.channelId !== channelId) return;
+      if (!(await roomStillLive(roomId, { type: 'CHANNEL_CALL', channelId }))) return;
 
       const named = channelCallPush(startedByName, channelName);
       const ringPayload = {
@@ -206,6 +235,10 @@ export const notificationWorker = new Worker(
       let cursor: string | undefined;
       let notified = 0;
       for (;;) {
+        if (!(await roomStillLive(roomId, { type: 'CHANNEL_CALL', channelId }))) {
+          logger.info({ jobId: job.id, roomId, channelId, notified }, 'Channel call ring stopped because the call ended');
+          return;
+        }
         const members = await prisma.channelMembership.findMany({
           where: {
             channelId,
@@ -246,6 +279,7 @@ export const notificationWorker = new Worker(
         startedByAvatarUrl?: string;
         channelId?: string;
       };
+      if (!(await roomStillLive(roomId, { type: 'PRAYER_WATCH' }))) return;
       const channelId = queuedChannelId ?? (await prisma.channel.findFirst({
         where: { type: 'GLOBAL_PRAYER_WATCH' },
         select: { id: true },
@@ -274,6 +308,10 @@ export const notificationWorker = new Worker(
       let notified = 0;
       // Keyset paginate over User.id — stable even with concurrent inserts.
       for (;;) {
+        if (!(await roomStillLive(roomId, { type: 'PRAYER_WATCH' }))) {
+          logger.info({ jobId: job.id, roomId, notified }, 'Prayer Watch ring stopped because the call ended');
+          return;
+        }
         const users = await prisma.user.findMany({
           where: {
             deletedAt: null,
@@ -500,6 +538,10 @@ export const notificationWorker = new Worker(
       const pushTitle = named.title;
       const pushBody = named.body;
       for (let i = 0; i < userIds.length; i += BATCH) {
+        if (!(await roomStillLive(roomId))) {
+          logger.info({ jobId: job.id, roomId, notified: i }, 'Audio room ring stopped because the room ended');
+          return;
+        }
         const chunkIds = userIds.slice(i, i + BATCH);
         await prisma.notification.createMany({
           data: chunkIds.map((userId) => ({

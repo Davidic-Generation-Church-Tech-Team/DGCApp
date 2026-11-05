@@ -1,8 +1,8 @@
 import { prisma } from '../../infra/db';
 import { buildRtcToken, isAgoraConfigured } from '../../infra/agora';
-import { emitToUser, emitToAudioRoom, emitToChannel, joinAudioRoom, leaveAudioRoom, closeAudioRoom } from '../../infra/realtime';
+import { emitToUser, emitToAudioRoom, emitToChannelExcept, emitCallEnded, joinAudioRoom, leaveAudioRoom } from '../../infra/realtime';
 import { notificationQueue } from '../../infra/queue';
-import { enqueue } from '../../infra/enqueue';
+import { enqueue, dropJob } from '../../infra/enqueue';
 import { pushService } from '../push/push.service';
 import { redis, withDeadline } from '../../infra/redis';
 import { logger } from '../../infra/logger';
@@ -32,6 +32,9 @@ const CHANNEL_CALL_RING_TTL_MS = 30_000;
 // Each new channel call rings (socket + push) every member, so one user may start at most one
 // new call per channel in this window. Joining a live call is never limited.
 const CHANNEL_CALL_START_COOLDOWN_S = 120;
+// After a call ends, ignore new starts for as long as that ring can still be on a phone.
+// A late join or a retried start must not open a second call.
+const CALL_ENDED_BLOCK_S = CHANNEL_CALL_RING_TTL_MS / 1000;
 
 const CHANNEL_CALL_SELECT = {
   id: true,
@@ -176,23 +179,48 @@ export function addParticipantIfLive(roomId: string, userId: string, role: 'HOST
   });
 }
 
+function endedCallKey(channelId: string | null, type: string) {
+  if (type === 'PRAYER_WATCH') return 'call-ended:prayer-watch';
+  if (type === 'CHANNEL_CALL' && channelId) return `call-ended:channel:${channelId}`;
+  return null;
+}
+
+// True when this channel or Prayer Watch ended a call inside the ring window.
+export async function callJustEnded(scope: { channelId?: string | null; type: 'CHANNEL_CALL' | 'PRAYER_WATCH' }) {
+  const key = endedCallKey(scope.channelId ?? null, scope.type);
+  if (!key) return false;
+  const marked = await withDeadline(redis.get(key), 500, null as string | null);
+  return Boolean(marked);
+}
+
+// Tells everyone still on the call, and everyone still ringing in the channel, that it is over.
+// Also drops a ring job that has not started, and blocks a brand-new call for the ring window.
+export async function publishRoomEnded(roomId: string, channelId: string | null, type: string) {
+  emitCallEnded(roomId, channelId);
+  const key = endedCallKey(channelId, type);
+  if (key) {
+    await withDeadline(redis.set(key, roomId, 'EX', CALL_ENDED_BLOCK_S), 500, null as string | null);
+  }
+  if (type === 'CHANNEL_CALL') dropJob(notificationQueue, `channel-call-started-${roomId}`);
+  if (type === 'PRAYER_WATCH') dropJob(notificationQueue, `prayer-watch-live-${roomId}`);
+}
+
 // Ends a LIVE room when nobody is left on it. Locks the row so the count can't race a join.
 // Returns true only for the caller that actually ended it (so 'ended' is emitted once).
 async function endIfEmpty(roomId: string): Promise<boolean> {
   const ended = await prisma.$transaction(async (tx) => {
-    const rows = await tx.$queryRaw<{ status: string }[]>`
-      SELECT "status" FROM "AudioRoom" WHERE "id" = ${roomId} FOR UPDATE`;
-    if (rows[0]?.status !== 'LIVE') return false;
+    const rows = await tx.$queryRaw<{ status: string; channelId: string | null; type: string }[]>`
+      SELECT "status", "channelId", "type" FROM "AudioRoom" WHERE "id" = ${roomId} FOR UPDATE`;
+    const row = rows[0];
+    if (row?.status !== 'LIVE') return null;
     const remaining = await tx.audioRoomParticipant.count({ where: { roomId, leftAt: null } });
-    if (remaining > 0) return false;
+    if (remaining > 0) return null;
     await tx.audioRoom.update({ where: { id: roomId }, data: { status: 'ENDED', endedAt: new Date() } });
-    return true;
+    return { channelId: row.channelId, type: row.type };
   });
-  if (ended) {
-    emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
-    closeAudioRoom(roomId);
-  }
-  return ended;
+  if (!ended) return false;
+  await publishRoomEnded(roomId, ended.channelId, ended.type);
+  return true;
 }
 
 async function isLastActiveParticipant(userId: string, roomId: string): Promise<boolean> {
@@ -276,38 +304,50 @@ export const audioRoomService = {
     return { channelId, live: await liveChannelCall(channelId) };
   },
 
+  // Joins a call that is already live. If it ended under us, stop. Never open a replacement call.
+  async joinLiveChannelCall(
+    userId: string,
+    role: string,
+    existing: { id: string },
+    known: { channelRole: string | null },
+  ) {
+    const p = await prisma.audioRoomParticipant.findFirst({
+      where: { roomId: existing.id, userId, leftAt: null },
+      select: { id: true, role: true },
+    });
+    if (!p) {
+      let created;
+      try {
+        created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
+      } catch (err) {
+        if ((err as { message?: string }).message === 'Room is not live') {
+          throw BadRequest('This call has ended');
+        }
+        throw err;
+      }
+      joinAudioRoom(userId, existing.id);
+      emitToAudioRoom(existing.id, 'audio-room:user-joined', withAgoraUid(created));
+    } else if (p.role === 'LISTENER') {
+      await prisma.audioRoomParticipant.update({ where: { id: p.id }, data: { role: 'SPEAKER' } });
+      emitToAudioRoom(existing.id, 'audio-room:role-changed', {
+        roomId: existing.id, userId, role: 'SPEAKER',
+      });
+    }
+    const token = this.issueToken(existing.id, userId, 'host');
+    emitToUser(userId, 'audio-room:token', { roomId: existing.id, ...token });
+    const detail = await this.get(userId, existing.id, role, known);
+    return { ...detail, agora: token, alreadyLive: true };
+  },
+
   async startChannelCall(userId: string, role: string, channelId: string): Promise<unknown> {
     const { channel, membership } = await requireChannelCallStarter(userId, role, channelId);
     const known = { channelRole: membership?.role ?? null };
     const existing = await liveChannelCall(channelId);
-    if (existing) {
-      const p = await prisma.audioRoomParticipant.findFirst({
-        where: { roomId: existing.id, userId, leftAt: null },
-        select: { id: true, role: true },
-      });
-      if (!p) {
-        let created;
-        try {
-          created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
-        } catch (err) {
-          // The call ended between the lookup and the join — start a fresh one instead.
-          if ((err as { message?: string }).message === 'Room is not live') {
-            return this.startChannelCall(userId, role, channelId);
-          }
-          throw err;
-        }
-        joinAudioRoom(userId, existing.id);
-        emitToAudioRoom(existing.id, 'audio-room:user-joined', withAgoraUid(created));
-      } else if (p.role === 'LISTENER') {
-        await prisma.audioRoomParticipant.update({ where: { id: p.id }, data: { role: 'SPEAKER' } });
-        emitToAudioRoom(existing.id, 'audio-room:role-changed', {
-          roomId: existing.id, userId, role: 'SPEAKER',
-        });
-      }
-      const token = this.issueToken(existing.id, userId, 'host');
-      emitToUser(userId, 'audio-room:token', { roomId: existing.id, ...token });
-      const detail = await this.get(userId, existing.id, role, known);
-      return { ...detail, agora: token, alreadyLive: true };
+    if (existing) return this.joinLiveChannelCall(userId, role, existing, known);
+
+    // A ring for the call that just ended must not be turned into a new call.
+    if (await callJustEnded({ channelId, type: 'CHANNEL_CALL' })) {
+      throw BadRequest('This call has ended');
     }
 
     // Fails open if Redis is unavailable: a missed limit is better than blocking calls.
@@ -347,14 +387,14 @@ export const audioRoomService = {
     } catch (err) {
       if ((err as { code?: string }).code === 'P2002') {
         const raced = await liveChannelCall(channelId);
-        if (raced) return this.startChannelCall(userId, role, channelId);
+        if (raced) return this.joinLiveChannelCall(userId, role, raced, known);
       }
       throw err;
     }
 
     joinAudioRoom(userId, room.id);
     const incoming = channelIncomingPayload(room, channelName, starter);
-    emitToChannel(channelId, 'audio-room:incoming', incoming);
+    emitToChannelExcept(channelId, userId, 'audio-room:incoming', incoming);
     enqueue(
       notificationQueue,
       'channel-call-started',
@@ -621,8 +661,7 @@ export const audioRoomService = {
       data: { leftAt: new Date() },
     });
 
-    emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
-    closeAudioRoom(roomId);
+    await publishRoomEnded(roomId, room.channelId, room.type);
     return updated;
   },
 
@@ -686,7 +725,7 @@ export const audioRoomService = {
 
     const room = await prisma.audioRoom.findUnique({
       where: { id: roomId },
-      select: { isPersistent: true },
+      select: { isPersistent: true, channelId: true, type: true },
     });
 
     // Persistent rooms (Prayer Watch call): NO host promotion, NO auto-end on host leave.
@@ -721,8 +760,7 @@ export const audioRoomService = {
           where: { roomId, leftAt: null },
           data: { leftAt: new Date() },
         });
-        emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
-        closeAudioRoom(roomId);
+        await publishRoomEnded(roomId, room?.channelId ?? null, room?.type ?? 'GENERAL');
       }
     }
     return { ok: true };

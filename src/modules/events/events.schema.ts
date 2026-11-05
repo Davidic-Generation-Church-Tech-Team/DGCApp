@@ -7,6 +7,17 @@ const optionalId = z
   .optional()
   .transform((v) => (v === '' ? undefined : v));
 
+// "" clears the flyer on edit. A missing field leaves it unchanged. Only https is stored.
+const optionalImageUrl = z
+  .union([z.string().max(2000), z.literal('')])
+  .optional()
+  .transform((v) => {
+    if (v === undefined) return undefined;
+    const trimmed = v.trim();
+    return trimmed.length ? trimmed : null;
+  })
+  .refine((v) => v == null || v.startsWith('https://'), { message: 'Image must be an https link' });
+
 export const createEventSchema = z
   .object({
     title: z.string().min(1).max(200),
@@ -14,6 +25,7 @@ export const createEventSchema = z
     location: z.string().max(300).optional(),
     startsAt: z.coerce.date(),
     endsAt: z.coerce.date().optional(),
+    imageUrl: optionalImageUrl,
     branchId: optionalId, // branch event
     clusterId: optionalId, // cluster event; neither = global
   })
@@ -27,6 +39,7 @@ export const updateEventSchema = z
     location: z.string().max(300).optional(),
     startsAt: z.coerce.date().optional(),
     endsAt: z.coerce.date().optional(),
+    imageUrl: optionalImageUrl,
   })
   .strict();
 

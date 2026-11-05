@@ -1,5 +1,8 @@
 import { prisma } from '../../infra/db';
+import { notificationQueue } from '../../infra/queue';
+import { enqueue } from '../../infra/enqueue';
 import { NotFound, Forbidden, BadRequest } from '../../utils/errors';
+import { announcementPushCopy, notificationImageUrl } from '../announcements/announcementPushCopy';
 import { pushService } from '../push/push.service';
 import type { CreateEventInput, UpdateEventInput } from './events.schema';
 
@@ -8,6 +11,7 @@ const EVENT_SELECT = {
   title: true,
   description: true,
   location: true,
+  imageUrl: true,
   startsAt: true,
   endsAt: true,
   branchId: true,
@@ -61,20 +65,39 @@ function eventReminderCopy(title: string, startsAt: Date) {
   };
 }
 
-// Church-wide events reach every active member. A branch or cluster event reaches that
-// group. Someone who already said they are not coming is left out.
-async function reminderPage(
-  event: { id: string; branchId: string | null; clusterId: string | null },
+// The day-before reminder goes only to people who said they are coming or interested.
+// No RSVP, and Not Going, stay quiet.
+async function reminderPage(eventId: string, cursor?: string) {
+  const rows = await prisma.eventRSVP.findMany({
+    where: {
+      eventId,
+      status: { in: ['GOING', 'INTERESTED'] },
+      user: { deletedAt: null, suspendedAt: null },
+      ...(cursor ? { id: { gt: cursor } } : {}),
+    },
+    orderBy: { id: 'asc' },
+    take: REMINDER_BATCH,
+    select: { id: true, userId: true },
+  });
+  return rows.map((row) => ({ cursor: row.id, userId: row.userId }));
+}
+
+// Who hears that an event was just created. A church-wide event reaches every active member.
+// A branch or cluster event reaches that group. The admin who posted it is left out.
+async function createdAudiencePage(
+  event: { branchId: string | null; clusterId: string | null },
+  excludeUserId: string | undefined,
   cursor?: string,
 ) {
-  const activeUser = {
-    deletedAt: null,
-    suspendedAt: null,
-    eventRsvps: { none: { eventId: event.id, status: 'NOT_GOING' as const } },
-  };
+  const activeUser = { deletedAt: null, suspendedAt: null };
   if (event.branchId) {
     const rows = await prisma.branchMembership.findMany({
-      where: { branchId: event.branchId, ...(cursor ? { id: { gt: cursor } } : {}), user: activeUser },
+      where: {
+        branchId: event.branchId,
+        ...(cursor ? { id: { gt: cursor } } : {}),
+        ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+        user: activeUser,
+      },
       orderBy: { id: 'asc' },
       take: REMINDER_BATCH,
       select: { id: true, userId: true },
@@ -83,15 +106,23 @@ async function reminderPage(
   }
   if (event.clusterId) {
     const rows = await prisma.clusterMembership.findMany({
-      where: { clusterId: event.clusterId, ...(cursor ? { id: { gt: cursor } } : {}), user: activeUser },
+      where: {
+        clusterId: event.clusterId,
+        ...(cursor ? { id: { gt: cursor } } : {}),
+        ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+        user: activeUser,
+      },
       orderBy: { id: 'asc' },
       take: REMINDER_BATCH,
       select: { id: true, userId: true },
     });
     return rows.map((row) => ({ cursor: row.id, userId: row.userId }));
   }
+  const id: { gt?: string; not?: string } = {};
+  if (cursor) id.gt = cursor;
+  if (excludeUserId) id.not = excludeUserId;
   const rows = await prisma.user.findMany({
-    where: { ...activeUser, ...(cursor ? { id: { gt: cursor } } : {}) },
+    where: { ...activeUser, ...(id.gt || id.not ? { id } : {}) },
     orderBy: { id: 'asc' },
     take: REMINDER_BATCH,
     select: { id: true },
@@ -198,13 +229,91 @@ export const eventService = {
         location: dto.location ?? null,
         startsAt: dto.startsAt,
         endsAt: dto.endsAt ?? null,
+        imageUrl: dto.imageUrl ?? null,
         branchId: dto.branchId ?? null,
         clusterId: dto.clusterId ?? null,
         createdById: userId,
       },
       select: EVENT_SELECT,
     });
+    const copy = announcementPushCopy({
+      title: created.title,
+      body: created.description,
+      imageUrl: created.imageUrl,
+    });
+    enqueue(
+      notificationQueue,
+      'event-created',
+      {
+        eventId: created.id,
+        title: copy.title,
+        body: copy.body,
+        imageUrl: copy.imageUrl,
+        startsAt: created.startsAt.toISOString(),
+        branchId: created.branchId,
+        clusterId: created.clusterId,
+        excludeUserId: userId,
+      },
+      { jobId: `event-created-${created.id}` },
+    );
     return forMembers(created);
+  },
+
+  // Paged fan-out for a new event. Same picture rules as an announcement: a JPEG with the
+  // title, or the title and the opening of the description when there is no picture.
+  // `cursor` is the last page that already went out. A retry starts after it, so a failed
+  // job does not ring the whole church again. `onPage` runs only after that page is sent.
+  async notifyEventCreated(
+    input: {
+      eventId: string;
+      title: string;
+      body?: string | null;
+      imageUrl?: string | null;
+      startsAt: string;
+      branchId?: string | null;
+      clusterId?: string | null;
+      excludeUserId?: string;
+      cursor?: string;
+    },
+    onPage?: (cursor: string) => Promise<void>,
+  ) {
+    const startsAt = new Date(input.startsAt);
+    const data = {
+      ...eventPushData(input.eventId, input.title, startsAt),
+      ...(input.imageUrl ? { imageUrl: input.imageUrl } : {}),
+    };
+    let notified = 0;
+    let cursor = input.cursor;
+    for (;;) {
+      const page = await createdAudiencePage(
+        { branchId: input.branchId ?? null, clusterId: input.clusterId ?? null },
+        input.excludeUserId,
+        cursor,
+      );
+      if (!page.length) break;
+      const userIds = page.map((row) => row.userId);
+      const res = await prisma.notification.createMany({
+        data: userIds.map((userId) => ({
+          userId,
+          type: 'EVENT' as const,
+          title: input.title,
+          body: input.body ?? null,
+          data,
+        })),
+      });
+      notified += res.count;
+      await pushService.sendToUsers(userIds, {
+        title: input.title,
+        body: input.body ?? null,
+        imageUrl: input.imageUrl ?? null,
+        data,
+        threadId: `event:${input.eventId}`,
+      });
+      cursor = page[page.length - 1]!.cursor;
+      if (onPage) await onPage(cursor);
+      if (page.length < REMINDER_BATCH) break;
+    }
+    return { notified };
   },
 
   // Edit an event's details (scope stays fixed). Same authority as creating it.
@@ -268,14 +377,14 @@ export const eventService = {
     return { ok: true, checkedInAt };
   },
 
-  // Runs every 15 minutes. About a day before an event starts, remind the people it is for,
-  // once. Moving startsAt clears reminderSentAt so the new time can be reminded too.
+  // Runs every 15 minutes. About a day before an event starts, remind people who RSVP'd
+  // Going or Interested, once. Moving startsAt clears reminderSentAt so the new time can be reminded too.
   async sendDueEventReminders(windowMs = 24 * 60 * 60 * 1000) {
     const now = new Date();
     const windowEnd = new Date(now.getTime() + windowMs);
     const events = await prisma.event.findMany({
       where: { reminderSentAt: null, startsAt: { gt: now, lte: windowEnd } },
-      select: { id: true, title: true, startsAt: true, branchId: true, clusterId: true },
+      select: { id: true, title: true, imageUrl: true, startsAt: true },
     });
     let notified = 0;
     for (const ev of events) {
@@ -286,12 +395,16 @@ export const eventService = {
       if (claimed.count !== 1) continue;
 
       const { title, body } = eventReminderCopy(ev.title, ev.startsAt);
-      const data = eventPushData(ev.id, title, ev.startsAt);
+      const imageUrl = ev.imageUrl ? notificationImageUrl(ev.imageUrl) : null;
+      const data = {
+        ...eventPushData(ev.id, title, ev.startsAt),
+        ...(imageUrl ? { imageUrl } : {}),
+      };
       const before = notified;
       try {
         let cursor: string | undefined;
         for (;;) {
-          const page = await reminderPage(ev, cursor);
+          const page = await reminderPage(ev.id, cursor);
           if (!page.length) break;
           const userIds = page.map((row) => row.userId);
           const res = await prisma.notification.createMany({
@@ -307,6 +420,7 @@ export const eventService = {
           await pushService.sendToUsers(userIds, {
             title,
             body,
+            imageUrl,
             data,
             threadId: `event:${ev.id}`,
           });

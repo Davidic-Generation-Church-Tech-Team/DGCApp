@@ -76,10 +76,10 @@ The server signs the user up for a call's events automatically when they start o
 
 | Event | Who receives it | What the app should do |
 |---|---|---|
-| `audio-room:incoming` | Every member of the channel, including the starter | Show the incoming call screen and the Join banner, unless the current user started the call. Stop ringing after 30 seconds. |
+| `audio-room:incoming` | Every member of the channel except the person who started the call | Show the incoming call screen and the Join banner. Stop ringing after 30 seconds, or as soon as `audio-room:ended` arrives for that `roomId`. |
 | `audio-room:user-joined` | Everyone on the call | Add the person to the call screen. |
 | `audio-room:user-left` | Everyone on the call | Remove the person from the call screen. |
-| `audio-room:ended` | Everyone on the call | Leave Agora, close the call screen, show "Call ended". |
+| `audio-room:ended` | Everyone on the call, and everyone in the channel who is only ringing | Leave Agora if you were on the call. Close the call screen and the incoming screen. Show "Call ended". The payload is `{ roomId, channelId }`. |
 | `audio-room:kicked` | The person removed | Leave Agora, close the call screen, show "You were removed from the call". |
 | `audio-room:muted` | The person muted | Turn off their mic in Agora and update the mic button. |
 | `audio-room:user-muted`, `audio-room:all-muted`, `audio-room:user-unmuted` | Everyone on the call | Show or clear the muted icon on the right people. |
@@ -87,10 +87,11 @@ The server signs the user up for a call's events automatically when they start o
 | `audio-room:token` | One user | Give Agora the new token. |
 | `audio-room:state` | One user, after reconnecting | Replace the list of people on the call with this one. |
 
-**Important:** the "call ended" event only reaches people **on** the call. Members who are still being rung, or who are looking at the Join banner, are not told. So the app must:
+**Important:** `audio-room:ended` now reaches people who are only ringing, as well as people on the call. Match it on `roomId` and close the incoming screen. The app must also:
 
 - stop ringing after 30 seconds no matter what;
-- show "This call has ended" if joining fails with "Room is not live";
+- show "This call has ended" if joining fails with "Room is not live" or "This call has ended";
+- not call start again after that error. The server will not open a replacement call;
 - check whether a call is live each time the channel screen comes into view.
 
 ### Ringing when the app is closed
@@ -141,11 +142,12 @@ Errors come back with a status, a short code (such as `FORBIDDEN`) and a message
 | When | Error | What the app should do |
 |---|---|---|
 | Starting a call | Too many requests: "Please wait a moment before starting another call in this channel" | Show that message. Each person can start a new call in the same channel at most once every 2 minutes. Joining a call that's already running is never limited. |
+| Starting a call just after one ended | "This call has ended" | The call is over, or it ended in the last 30 seconds. Do not call start again. Show "This call has ended" and hide the banner. A real new call can be started after that. |
 | Starting or checking a call | "Channel not found" | Show "Channel not found" and leave the screen. |
 | Starting or checking a call | "You are not a member of this channel" | Show that message. |
 | Starting a call in a read-only channel | "Only moderators can start calls in read-only channels" | Hide the call button for this user. |
 | Starting a call in a DM or Prayer Watch | "Use DM calls…" / "Use /api/v1/prayer-watch/start…" | App bug: those have their own call flows. |
-| Joining | "Room not found" or "Room is not live" | Show "This call has ended" and hide the banner. |
+| Joining | "Room not found", "Room is not live", or "This call has ended" | Show "This call has ended" and hide the banner. Do not start a new call. |
 | Joining | "Already in this room" | Not a real error: the user is already on the call (double tap or another device). Fetch the call details and carry on. |
 | Leaving | "Not in this room" | The user is already off the call. Close the call screen quietly. |
 | Ending | "Room already ended" or "Room not found" | Close the call screen quietly. |

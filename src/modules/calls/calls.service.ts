@@ -5,7 +5,7 @@ import { buildRtcToken, isAgoraConfigured } from '../../infra/agora';
 import { env } from '../../config/env';
 import { emitToUser } from '../../infra/realtime';
 import { notificationQueue } from '../../infra/queue';
-import { enqueue } from '../../infra/enqueue';
+import { enqueue, dropJob } from '../../infra/enqueue';
 import { pushService } from '../push/push.service';
 import { notificationService } from '../notifications/notifications.service';
 import { BadRequest, Conflict, Forbidden, NotFound } from '../../utils/errors';
@@ -330,6 +330,7 @@ export const callService = {
 
     const declined = await prisma.call.findUnique({ where: { id: callId }, select: CALL_SELECT });
     if (!declined) throw NotFound('Call not found');
+    dropJob(notificationQueue, `call-incoming-${callId}`);
     emitSerializedToParticipants(declined, 'call:declined');
     return serializeCall(declined, userId);
   },
@@ -356,6 +357,8 @@ export const callService = {
 
     const ended = await prisma.call.findUnique({ where: { id: callId }, select: CALL_SELECT });
     if (!ended) throw NotFound('Call not found');
+    // A cancel that lands before the worker runs must not still ring the other phone.
+    if (status === 'CANCELLED') dropJob(notificationQueue, `call-incoming-${callId}`);
     emitSerializedToParticipants(ended, 'call:ended');
     return serializeCall(ended, userId);
   },
@@ -372,6 +375,9 @@ export const callService = {
     const call = await prisma.call.findUnique({ where: { id: callId }, select: CALL_SELECT });
     if (!call || call.status !== 'RINGING') return { ok: false, skipped: true };
     const named = directCallPush(displayName(call.caller), call.type);
+    // The caller can hang up while this payload is being built. Check again before the phone rings.
+    const still = await prisma.call.findUnique({ where: { id: callId }, select: { status: true } });
+    if (still?.status !== 'RINGING') return { ok: false, skipped: true };
     await pushService.sendIncomingCallToUser(call.calleeId, {
       title: named.title,
       body: named.body,

@@ -651,6 +651,7 @@ model Event {
   title       String
   description String?
   location    String?
+  imageUrl    String? // optional flyer; the create push sends a small JPEG of this
   startsAt    DateTime
   endsAt      DateTime?
   createdById String // scalar audit field

@@ -1,9 +1,9 @@
 import { prisma } from '../../infra/db';
-import { joinAudioRoom, emitToAudioRoom, emitToUser, closeAudioRoom } from '../../infra/realtime';
+import { joinAudioRoom, emitToAudioRoom, emitToUser } from '../../infra/realtime';
 import { notificationQueue } from '../../infra/queue';
 import { enqueue } from '../../infra/enqueue';
 import { redis, withDeadline } from '../../infra/redis';
-import { addParticipantIfLive, audioRoomService, stableUid } from '../audio-rooms/audio-rooms.service';
+import { addParticipantIfLive, audioRoomService, callJustEnded, publishRoomEnded, stableUid } from '../audio-rooms/audio-rooms.service';
 import { isClusterModerator } from '../../utils/authorization';
 import { BadRequest, Forbidden, NotFound } from '../../utils/errors';
 
@@ -126,8 +126,16 @@ export const prayerWatchService = {
       });
       if (!p) {
         // Fresh join → SPEAKER for everyone.
-        // Guarded insert: fails with "Room is not live" if the last participant just ended it.
-        const created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
+        // If the last person ended it under us, do not open a replacement call.
+        let created;
+        try {
+          created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
+        } catch (err) {
+          if ((err as { message?: string }).message === 'Room is not live') {
+            throw BadRequest('This call has ended');
+          }
+          throw err;
+        }
         joinAudioRoom(userId, existing.id);
         emitToAudioRoom(existing.id, 'audio-room:user-joined', { ...created, agoraUid: stableUid(userId) });
       } else if (p.role === 'LISTENER') {
@@ -150,6 +158,12 @@ export const prayerWatchService = {
     // No live call — create one. Starter is HOST; room is persistent so it survives the starter
     // leaving. isPersistent + type=PRAYER_WATCH together instruct leave() to end the room only
     // when the LAST participant leaves.
+    // A phone still showing the call that just ended must not open a new one.
+    if (await callJustEnded({ type: 'PRAYER_WATCH' })) {
+      if (holdsLock) redis.del(LOCK_KEY).catch(() => {});
+      throw BadRequest('This call has ended');
+    }
+
     let room;
     try {
       room = await prisma.audioRoom.create({
@@ -218,8 +232,11 @@ export const prayerWatchService = {
       data: { leftAt: new Date() },
     });
 
-    emitToAudioRoom(roomId, 'audio-room:ended', { roomId });
-    closeAudioRoom(roomId);
+    const channel = await prisma.channel.findFirst({
+      where: { type: 'GLOBAL_PRAYER_WATCH' },
+      select: { id: true },
+    });
+    await publishRoomEnded(roomId, channel?.id ?? null, 'PRAYER_WATCH');
     return { ok: true };
   },
 };
