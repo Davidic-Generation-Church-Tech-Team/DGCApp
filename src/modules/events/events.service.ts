@@ -1,7 +1,7 @@
 import { prisma } from '../../infra/db';
 import { notificationQueue } from '../../infra/queue';
 import { enqueue } from '../../infra/enqueue';
-import { NotFound, Forbidden, BadRequest } from '../../utils/errors';
+import { NotFound, Forbidden, BadRequest, type AppError } from '../../utils/errors';
 import { announcementPushCopy, notificationImageUrl } from '../announcements/announcementPushCopy';
 import { pushService } from '../push/push.service';
 import type { CreateEventInput, UpdateEventInput } from './events.schema';
@@ -24,6 +24,23 @@ const EVENT_SELECT = {
 };
 
 const REMINDER_BATCH = 1000;
+
+function cleanEventId(eventId: string) {
+  return eventId.trim().replace(/^["']+|["']+$/g, '');
+}
+
+// The list also carries branchId and branch.id. Those are not the event id, and delete
+// with one of them looks like the event vanished from the database.
+async function missingEvent(id: string): Promise<AppError> {
+  if (id) {
+    const other = await prisma.event.findFirst({
+      where: { OR: [{ branchId: id }, { clusterId: id }] },
+      select: { id: true },
+    });
+    if (other) return NotFound('Event not found. Use the event id, not the branch or cluster id.');
+  }
+  return NotFound('Event not found');
+}
 
 function forMembers<T extends { createdById: string }>(event: T) {
   const { createdById: _createdById, ...rest } = event;
@@ -196,15 +213,16 @@ export const eventService = {
   },
 
   async get(userId: string, eventId: string) {
-    const event = await prisma.event.findUnique({ where: { id: eventId }, select: EVENT_SELECT });
-    if (!event) throw NotFound('Event not found');
+    const id = cleanEventId(eventId);
+    const event = await prisma.event.findUnique({ where: { id }, select: EVENT_SELECT });
+    if (!event) throw await missingEvent(id);
 
-    const grouped = await prisma.eventRSVP.groupBy({ by: ['status'], where: { eventId }, _count: true });
+    const grouped = await prisma.eventRSVP.groupBy({ by: ['status'], where: { eventId: id }, _count: true });
     const rsvpCounts: Record<'GOING' | 'INTERESTED' | 'NOT_GOING', number> = { GOING: 0, INTERESTED: 0, NOT_GOING: 0 };
     for (const g of grouped) rsvpCounts[g.status] = g._count;
 
     const mine = await prisma.eventRSVP.findUnique({
-      where: { eventId_userId: { eventId, userId } },
+      where: { eventId_userId: { eventId: id, userId } },
       select: { status: true, checkedInAt: true },
     });
     return { ...forMembers(event), rsvpCounts, myRsvp: mine?.status ?? null, checkedInAt: mine?.checkedInAt ?? null };
@@ -318,15 +336,16 @@ export const eventService = {
 
   // Edit an event's details (scope stays fixed). Same authority as creating it.
   async update(userId: string, role: string, eventId: string, dto: UpdateEventInput) {
+    const id = cleanEventId(eventId);
     const event = await prisma.event.findUnique({
-      where: { id: eventId },
+      where: { id },
       select: { id: true, branchId: true, clusterId: true, startsAt: true },
     });
-    if (!event) throw NotFound('Event not found');
+    if (!event) throw await missingEvent(id);
     await assertCanManage(userId, role, event.branchId, event.clusterId);
     const startsAtMoved = dto.startsAt != null && dto.startsAt.getTime() !== event.startsAt.getTime();
     const updated = await prisma.event.update({
-      where: { id: eventId },
+      where: { id },
       data: { ...dto, ...(startsAtMoved ? { reminderSentAt: null } : {}) },
       select: EVENT_SELECT,
     });
@@ -335,23 +354,25 @@ export const eventService = {
 
   // Delete/cancel an event. RSVPs cascade away with it.
   async remove(userId: string, role: string, eventId: string) {
+    const id = cleanEventId(eventId);
     const event = await prisma.event.findUnique({
-      where: { id: eventId },
+      where: { id },
       select: { branchId: true, clusterId: true },
     });
-    if (!event) throw NotFound('Event not found');
+    if (!event) throw await missingEvent(id);
     await assertCanManage(userId, role, event.branchId, event.clusterId);
-    await prisma.event.delete({ where: { id: eventId } });
+    await prisma.event.delete({ where: { id } });
     return { ok: true };
   },
 
   async rsvp(userId: string, role: string, eventId: string, status: 'GOING' | 'INTERESTED' | 'NOT_GOING') {
-    const event = await prisma.event.findUnique({ where: { id: eventId }, select: { branchId: true, clusterId: true } });
-    if (!event) throw NotFound('Event not found');
+    const id = cleanEventId(eventId);
+    const event = await prisma.event.findUnique({ where: { id }, select: { branchId: true, clusterId: true } });
+    if (!event) throw await missingEvent(id);
     await assertCanAttend(userId, role, event);
     await prisma.eventRSVP.upsert({
-      where: { eventId_userId: { eventId, userId } },
-      create: { eventId, userId, status },
+      where: { eventId_userId: { eventId: id, userId } },
+      create: { eventId: id, userId, status },
       update: { status },
     });
     return { ok: true };
@@ -359,19 +380,20 @@ export const eventService = {
 
   // Withdraw an RSVP entirely (undo) — removes the row, unlike NOT_GOING which keeps a decline.
   async unrsvp(userId: string, eventId: string) {
-    await prisma.eventRSVP.deleteMany({ where: { eventId, userId } });
+    await prisma.eventRSVP.deleteMany({ where: { eventId: cleanEventId(eventId), userId } });
     return { ok: true };
   },
 
   // QR check-in: the QR encodes the event id; scanning hits this endpoint.
   async checkIn(userId: string, role: string, eventId: string) {
-    const event = await prisma.event.findUnique({ where: { id: eventId }, select: { branchId: true, clusterId: true } });
-    if (!event) throw NotFound('Event not found');
+    const id = cleanEventId(eventId);
+    const event = await prisma.event.findUnique({ where: { id }, select: { branchId: true, clusterId: true } });
+    if (!event) throw await missingEvent(id);
     await assertCanAttend(userId, role, event);
     const checkedInAt = new Date();
     await prisma.eventRSVP.upsert({
-      where: { eventId_userId: { eventId, userId } },
-      create: { eventId, userId, status: 'GOING', checkedInAt },
+      where: { eventId_userId: { eventId: id, userId } },
+      create: { eventId: id, userId, status: 'GOING', checkedInAt },
       update: { checkedInAt },
     });
     return { ok: true, checkedInAt };

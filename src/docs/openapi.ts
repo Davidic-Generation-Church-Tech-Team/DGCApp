@@ -745,7 +745,7 @@ registry.registerPath({
   method: 'delete',
   path: '/api/v1/events/{eventId}',
   tags: ['events'],
-  summary: 'Delete/cancel an event (removes its RSVPs) — super admin or the owning admin/moderator',
+  summary: 'Delete an event and its RSVPs. The path value is the event id (the top-level id from GET /events), not branchId or branch.id. Super admin, or the owning branch admin / cluster moderator.',
   security: bearer,
   request: { params: z.object({ eventId: z.string() }) },
   responses: {
@@ -1290,7 +1290,7 @@ const apiDescription = [
   '',
   '## HTTP caching (free speed on repeat views)',
   '',
-  'Stable GETs now send `Cache-Control: private, max-age=N` — `/branches` (300s), `/clusters` (60s), `/events` (60s), `/users/:userId` (120s). The device HTTP cache serves repeats instantly with zero network. iOS honours this automatically; on Android/React Native verify OkHttp caching or keep a small in-app cache keyed by URL that honours `max-age`. Chat, channels, and notifications are never cached — they must always be fresh.',
+  'Stable GETs now send `Cache-Control: private, max-age=N` — `/branches` (300s), `/clusters` (60s), `/users/:userId` (120s). The device HTTP cache serves repeats instantly with zero network. iOS honours this automatically; on Android/React Native verify OkHttp caching or keep a small in-app cache keyed by URL that honours `max-age`. Events, chat, channels, and notifications are not cached — a created or deleted event must show on the next fetch.',
   '',
   '## Sign up vs. sign in — which endpoint?',
   '',

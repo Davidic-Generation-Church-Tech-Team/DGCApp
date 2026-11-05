@@ -5,9 +5,11 @@ const prisma = {
   event: {
     findMany: vi.fn(),
     findUnique: vi.fn(),
+    findFirst: vi.fn(),
     updateMany: vi.fn(),
     update: vi.fn(),
     create: vi.fn(),
+    delete: vi.fn(),
   },
   eventRSVP: { findMany: vi.fn() },
   user: { findMany: vi.fn() },
@@ -325,5 +327,24 @@ describe('event reminders', () => {
       ),
     ).rejects.toThrow('push down');
     expect(onPage).not.toHaveBeenCalled();
+  });
+
+  it('deletes an event by its own id, even with spaces around the paste', async () => {
+    prisma.event.findUnique.mockResolvedValue({ branchId: null, clusterId: null });
+    prisma.event.delete.mockResolvedValue({});
+
+    await expect(eventService.remove('admin-1', 'SUPER_ADMIN', ' event-1 ')).resolves.toEqual({ ok: true });
+
+    expect(prisma.event.delete).toHaveBeenCalledWith({ where: { id: 'event-1' } });
+  });
+
+  it('does not treat a branch id as the event id', async () => {
+    prisma.event.findUnique.mockResolvedValue(null);
+    prisma.event.findFirst.mockResolvedValue({ id: 'event-1' });
+
+    await expect(eventService.remove('admin-1', 'SUPER_ADMIN', 'branch-1')).rejects.toThrow(
+      'Use the event id, not the branch or cluster id.',
+    );
+    expect(prisma.event.delete).not.toHaveBeenCalled();
   });
 });

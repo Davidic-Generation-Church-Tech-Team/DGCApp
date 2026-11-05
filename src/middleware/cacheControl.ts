@@ -14,3 +14,10 @@ export const cacheControl =
     res.set('Cache-Control', `private, max-age=${maxAgeSeconds}, stale-while-revalidate=${maxAgeSeconds}`);
     next();
   };
+
+// Events change the moment an admin creates or deletes one. A cached list still shows
+// the old row, and the next delete then says the event is missing.
+export const noStore: RequestHandler = (_req, res, next) => {
+  res.set('Cache-Control', 'private, no-store');
+  next();
+};
