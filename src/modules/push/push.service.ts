@@ -55,6 +55,9 @@ function pushData(p: PushPayload): Record<string, string> {
     ...(p.threadId ? { threadId: p.threadId } : {}),
     ...(httpsImage(p.imageUrl) ? { imageUrl: httpsImage(p.imageUrl) } : {}),
     ...p.data,
+    // Call screens often read the data bag and ignore the notification title.
+    title: p.title,
+    ...(p.body ? { body: p.body } : {}),
   });
 }
 
@@ -251,8 +254,13 @@ function incomingCallMessage(token: string, p: IncomingCallPushPayload): TokenMe
   const ttl = Math.max(1_000, Math.min(p.ttlMs ?? 30_000, 30_000));
   const title = p.title;
   const body = p.body ?? 'Incoming call';
+  const callerName =
+    typeof p.data?.callerName === 'string' && p.data.callerName.trim() ? p.data.callerName.trim() : title;
   const data = toStringMap({
     ...p.data,
+    title,
+    body,
+    callerName,
     priority: 'high',
     clickAction: 'INCOMING_CALL',
     androidChannelId: 'calls',
@@ -347,20 +355,25 @@ export const pushService = {
 
   async sendToUsers(userIds: string[], p: PushPayload) {
     if (!isAnyPushConfigured() || !userIds.length) return;
-    const rows = await prisma.deviceToken.findMany({ where: { userId: { in: userIds } }, select: { token: true, platform: true } });
-    // FCM multicast caps at 500 tokens per call. Batches ran sequentially before — a 10k-user
-    // fan-out took ~30s (10k / 500 = 20 batches × ~1.5s). Bounded concurrency of 5 cuts that
-    // to ~6s without swamping the single Render instance's HTTP pool. Each batch still swallows
-    // its own error so one FCM failure doesn't abort the whole fan-out.
+    // Look up tokens a thousand users at a time, then hand FCM at most 500 per call.
+    // Five of those calls run together so a church-wide push does not open one giant query
+    // or swamp the process with hundreds of HTTP requests at once.
     const CONCURRENCY = 5;
-    const batches: StoredDeviceToken[][] = [];
-    for (let i = 0; i < rows.length; i += 500) batches.push(rows.slice(i, i + 500));
-    for (let i = 0; i < batches.length; i += CONCURRENCY) {
-      await Promise.all(
-        batches.slice(i, i + CONCURRENCY).map((batch) =>
-          sendToTokens(batch, p).catch((err) => logger.error({ err }, 'push batch failed')),
-        ),
-      );
+    for (let i = 0; i < userIds.length; i += 1000) {
+      const slice = userIds.slice(i, i + 1000);
+      const rows = await prisma.deviceToken.findMany({
+        where: { userId: { in: slice } },
+        select: { token: true, platform: true },
+      });
+      const batches: StoredDeviceToken[][] = [];
+      for (let j = 0; j < rows.length; j += 500) batches.push(rows.slice(j, j + 500));
+      for (let j = 0; j < batches.length; j += CONCURRENCY) {
+        await Promise.all(
+          batches.slice(j, j + CONCURRENCY).map((batch) =>
+            sendToTokens(batch, p).catch((err) => logger.error({ err }, 'push batch failed')),
+          ),
+        );
+      }
     }
   },
 

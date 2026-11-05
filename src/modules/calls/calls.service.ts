@@ -10,7 +10,7 @@ import { pushService } from '../push/push.service';
 import { notificationService } from '../notifications/notifications.service';
 import { BadRequest, Conflict, Forbidden, NotFound } from '../../utils/errors';
 import type { InitiateCallInput, ListCallsInput } from './calls.schema';
-import { directCallPush } from './callPushCopy';
+import { callerLabel, directCallPush } from './callPushCopy';
 
 export const CALL_RING_TIMEOUT_MS = 30_000;
 
@@ -51,7 +51,7 @@ function stableUid(userId: string): number {
 }
 
 function displayName(user: { displayName: string | null }) {
-  return user.displayName ?? 'Someone';
+  return callerLabel(user.displayName);
 }
 
 function mediaLabel(type: 'AUDIO' | 'VIDEO') {
@@ -113,6 +113,8 @@ function callData(call: CallRecord, action: 'incoming' | 'answered' | 'declined'
 function serializeCall(call: CallRecord, viewerId: string) {
   return {
     ...call,
+    callerName: displayName(call.caller),
+    callerAvatarUrl: call.caller.avatarUrl ?? '',
     direction: call.callerId === viewerId ? 'OUTGOING' : 'INCOMING',
     ringingExpiresAt: ringingExpiresAt(call),
   };

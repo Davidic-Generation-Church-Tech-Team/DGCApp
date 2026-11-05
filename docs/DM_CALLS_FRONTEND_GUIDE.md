@@ -59,6 +59,8 @@ type DmCall = {
   endedAt: string | null;
   endedById: string | null;
   durationMs: number | null;
+  callerName: string; // flat name for the incoming screen. Same value as caller.displayName, or "Someone"
+  callerAvatarUrl: string;
   caller: {
     id: string;
     displayName: string | null;
@@ -342,6 +344,8 @@ type IncomingCallPushData = {
   agoraChannel: string;
   callerId: string;
   calleeId: string;
+  title: string; // "Ada started a call" — this is the notification headline
+  body: string; // "Voice call" or "Video call"
   callerName: string;
   callerAvatarUrl: string;
   createdAt: string;
@@ -469,7 +473,7 @@ await api.post(`/calls/${call.id}/decline`);
 
 - DM header has voice call button now.
 - Video button can be hidden for launch, but backend supports `type: 'VIDEO'`.
-- Incoming call screen shows caller name/avatar, call type, Answer, Decline.
+- Incoming call screen shows `callerName` (or `data.callerName` / `data.title` from the push) and the avatar, plus Answer and Decline. Do not hardcode "Incoming call". On iPhone CallKit, pass `callerName` as `localizedCallerName`.
 - Outgoing call screen shows peer name/avatar, Ringing, Cancel.
 - Active call screen shows mute, speaker, hang up, duration.
 - Stop all ringing/ringback audio on decline, answer, end, missed, timeout, logout, or socket disconnect cleanup.

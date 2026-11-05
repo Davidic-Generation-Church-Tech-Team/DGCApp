@@ -6,7 +6,9 @@ import { Forbidden, NotFound } from '../../utils/errors';
 import type { PostAnnouncementInput } from './announcements.schema';
 import { inspectMediaUrl, type MediaKind } from '../media/media.limits';
 import { asAdminAuthor } from '../../utils/adminAuthor';
+import { optimizeImage } from '../../utils/cloudinaryUrl';
 import { announcementPushCopy } from './announcementPushCopy';
+import { presentAnnouncement } from './announcementMedia';
 
 // PRD §4/§3: official comms. The Global Announcement channel is org-wide; each branch's read-only
 // "Service Updates" section is its branch announcement channel. Both are posted only by super admins
@@ -63,20 +65,23 @@ function pushPreview(attachments: { type: MediaKind }[]): string | null {
 // Post to an announcement channel + fan out a Notification to every member off the request path.
 async function broadcast(channelId: string, userId: string, input: PostAnnouncementInput) {
   const attachments = toAttachments(input);
+  const stored = attachments.map((item) =>
+    item.type === 'IMAGE' ? { ...item, url: optimizeImage(item.url) } : item,
+  );
   // Message + attachment rows are written in one nested create, so a failure leaves neither.
   const message = await prisma.message.create({
     data: {
       channelId,
       senderId: userId,
-      type: attachments[0]?.type ?? 'TEXT',
+      type: stored[0]?.type ?? 'TEXT',
       title: input.title,
       body: input.body?.trim() || null,
-      mediaUrl: attachments[0]?.url ?? null,
-      ...(attachments.length > 0 && { attachments: { create: attachments } }),
+      mediaUrl: stored[0]?.url ?? null,
+      ...(stored.length > 0 && { attachments: { create: stored } }),
     },
     select: ANNOUNCEMENT_SELECT,
   });
-  const shown = asAdminAuthor(message);
+  const shown = asAdminAuthor(presentAnnouncement(message));
   emitToChannel(channelId, 'message:new', shown); // live for members currently connected
   const push = announcementPushCopy({
     title: input.title,
@@ -102,7 +107,7 @@ async function listChannel(channelId: string) {
     take: 30,
     select: ANNOUNCEMENT_SELECT,
   });
-  return rows.map(asAdminAuthor);
+  return rows.map((row) => asAdminAuthor(presentAnnouncement(row)));
 }
 
 export const announcementService = {

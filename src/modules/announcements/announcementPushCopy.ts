@@ -13,8 +13,9 @@ function snippetOf(body: string | null | undefined): string | null {
   return `${short}…`;
 }
 
-// Phones should not pull the full upload just to paint a notification. Cloudinary
-// can hand back a small JPEG. Any other https image is left as the client stored it.
+// Phones paint a notification picture only from a small JPEG. f_auto comes back as WebP,
+// and a WebP is dropped, so the push looks like it has no image. Replace any existing
+// Cloudinary transform with one JPEG and a .jpg name.
 export function notificationImageUrl(url: string): string | null {
   let parsed: URL;
   try {
@@ -24,14 +25,23 @@ export function notificationImageUrl(url: string): string | null {
   }
   if (parsed.protocol !== 'https:') return null;
   if (parsed.hostname !== 'res.cloudinary.com') return url;
-  const parts = parsed.pathname.split('/');
+  const parts = parsed.pathname.split('/').filter((part) => part.length > 0);
   const uploadAt = parts.indexOf('upload');
   if (uploadAt < 0 || parts[uploadAt - 1] !== 'image') return url;
-  const next = parts[uploadAt + 1] ?? '';
-  if (!next || next.includes(',') || /^[a-z]_/.test(next)) return url;
-  parts.splice(uploadAt + 1, 0, 'f_jpg,q_auto,w_720,c_limit');
-  parsed.pathname = parts.join('/');
+  let rest = parts.slice(uploadAt + 1);
+  const first = rest[0] ?? '';
+  if (first.includes(',') || /^[a-z]{1,3}_/.test(first)) rest = rest.slice(1);
+  if (!rest.length) return null;
+  const last = rest.length - 1;
+  rest[last] = rest[last]!.replace(/\.[^.]+$/, '.jpg');
+  parsed.pathname = `/${[...parts.slice(0, uploadAt + 1), 'f_jpg,q_auto,w_720,c_limit', ...rest].join('/')}`;
   return parsed.toString();
+}
+
+function visibleLine(title: string, extra: string | null) {
+  if (!extra) return title;
+  if (extra.toLowerCase().startsWith(title.toLowerCase())) return extra;
+  return `${title}. ${extra}`;
 }
 
 export function announcementPushCopy(input: {
@@ -43,7 +53,6 @@ export function announcementPushCopy(input: {
   const title = input.title.trim() || 'Announcement';
   const imageUrl = input.imageUrl ? notificationImageUrl(input.imageUrl) : null;
   const snippet = snippetOf(input.body);
-  if (imageUrl) return { title, body: snippet, imageUrl };
   const fallback = input.fallback?.trim() || null;
-  return { title, body: snippet ?? fallback, imageUrl: null };
+  return { title, body: visibleLine(title, snippet ?? (imageUrl ? null : fallback)), imageUrl };
 }

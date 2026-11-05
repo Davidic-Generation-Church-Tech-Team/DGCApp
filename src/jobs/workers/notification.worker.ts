@@ -174,18 +174,6 @@ export const notificationWorker = new Worker(
       });
       if (!room || room.status !== 'LIVE' || room.type !== 'CHANNEL_CALL' || room.channelId !== channelId) return;
 
-      const members = await prisma.channelMembership.findMany({
-        where: {
-          channelId,
-          userId: { not: startedById },
-          mutedAt: null,
-          user: { deletedAt: null, suspendedAt: null },
-        },
-        select: { userId: true },
-      });
-      const userIds = members.map((m) => m.userId);
-      if (!userIds.length) return;
-
       const named = channelCallPush(startedByName, channelName);
       const ringPayload = {
         title: named.title,
@@ -214,11 +202,29 @@ export const notificationWorker = new Worker(
           deepLink: `dgc://channels/${channelId}/calls/${roomId}`,
         },
       };
-      // Batched like the other fan-outs so a large cluster doesn't load every device token at once.
-      for (let i = 0; i < userIds.length; i += BATCH) {
-        await pushService.sendIncomingCallToUsers(userIds.slice(i, i + BATCH), ringPayload);
+      // One page of members at a time. A large channel never sits in memory as one list.
+      let cursor: string | undefined;
+      let notified = 0;
+      for (;;) {
+        const members = await prisma.channelMembership.findMany({
+          where: {
+            channelId,
+            userId: { not: startedById },
+            mutedAt: null,
+            user: { deletedAt: null, suspendedAt: null },
+            ...(cursor ? { id: { gt: cursor } } : {}),
+          },
+          orderBy: { id: 'asc' },
+          take: BATCH,
+          select: { id: true, userId: true },
+        });
+        if (!members.length) break;
+        await pushService.sendIncomingCallToUsers(members.map((member) => member.userId), ringPayload);
+        notified += members.length;
+        cursor = members[members.length - 1]!.id;
+        if (members.length < BATCH) break;
       }
-      logger.info({ jobId: job.id, roomId, channelId, notified: userIds.length }, 'Channel call ring fan-out complete');
+      logger.info({ jobId: job.id, roomId, channelId, notified }, 'Channel call ring fan-out complete');
       return;
     }
 
@@ -304,15 +310,6 @@ export const notificationWorker = new Worker(
         imageUrl?: string | null;
         excludeUserId?: string;
       };
-      const members = await prisma.channelMembership.findMany({
-        where: {
-          channelId,
-          mutedAt: null,
-          user: { deletedAt: null, suspendedAt: null },
-          ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
-        },
-        select: { userId: true },
-      });
       const data = messagePushData({
         channelId,
         messageId,
@@ -320,27 +317,42 @@ export const notificationWorker = new Worker(
         imageUrl,
       });
       let created = 0;
-      for (let i = 0; i < members.length; i += BATCH) {
-        const chunk = members.slice(i, i + BATCH).map((m) => ({
-          userId: m.userId,
-          type: 'ANNOUNCEMENT' as const,
-          title,
-          body: body ?? null,
-          data,
-        }));
-        const res = await prisma.notification.createMany({ data: chunk });
+      let cursor: string | undefined;
+      for (;;) {
+        const members = await prisma.channelMembership.findMany({
+          where: {
+            channelId,
+            mutedAt: null,
+            user: { deletedAt: null, suspendedAt: null },
+            ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+            ...(cursor ? { id: { gt: cursor } } : {}),
+          },
+          orderBy: { id: 'asc' },
+          take: BATCH,
+          select: { id: true, userId: true },
+        });
+        if (!members.length) break;
+        const userIds = members.map((member) => member.userId);
+        const res = await prisma.notification.createMany({
+          data: userIds.map((userId) => ({
+            userId,
+            type: 'ANNOUNCEMENT' as const,
+            title,
+            body: body ?? null,
+            data,
+          })),
+        });
         created += res.count;
-      }
-      await pushService.sendToUsers(
-        members.map((m) => m.userId),
-        {
+        await pushService.sendToUsers(userIds, {
           title,
           body: body ?? null,
           imageUrl,
           data,
           threadId: `channel:${channelId}`,
-        },
-      );
+        });
+        cursor = members[members.length - 1]!.id;
+        if (members.length < BATCH) break;
+      }
       logger.info({ jobId: job.id, channelId, created }, 'Announcement fan-out complete');
       return;
     }
@@ -357,34 +369,42 @@ export const notificationWorker = new Worker(
         senderName: string;
         body: string | null;
       };
-      const [members, channel] = await Promise.all([
-        prisma.channelMembership.findMany({
-          where: { channelId, userId: { not: senderId }, mutedAt: null },
-          select: { userId: true },
-        }),
-        prisma.channel.findUnique({
-          where: { id: channelId },
-          select: {
-            type: true,
-            name: true,
-            branch: { select: { name: true } },
-            cluster: { select: { name: true } },
-          },
-        }),
-      ]);
-      if (!members.length) return;
+      const channel = await prisma.channel.findUnique({
+        where: { id: channelId },
+        select: {
+          type: true,
+          name: true,
+          branch: { select: { name: true } },
+          cluster: { select: { name: true } },
+        },
+      });
       const channelName = channelDisplayName(channel);
       const displaySender = senderName || 'Someone';
-      await pushService.sendToUsers(
-        members.map((m) => m.userId),
-        {
-          title: channelName,
-          body: `${displaySender}: ${body || 'Sent a message'}`,
-          data: messagePushData({ channelId, messageId, channelName, senderName: displaySender }),
-          category: 'MESSAGE_REPLY',
-          threadId: `channel:${channelId}`,
-        },
-      );
+      const payload = {
+        title: channelName,
+        body: `${displaySender}: ${body || 'Sent a message'}`,
+        data: messagePushData({ channelId, messageId, channelName, senderName: displaySender }),
+        category: 'MESSAGE_REPLY',
+        threadId: `channel:${channelId}`,
+      };
+      let cursor: string | undefined;
+      for (;;) {
+        const members = await prisma.channelMembership.findMany({
+          where: {
+            channelId,
+            userId: { not: senderId },
+            mutedAt: null,
+            ...(cursor ? { id: { gt: cursor } } : {}),
+          },
+          orderBy: { id: 'asc' },
+          take: BATCH,
+          select: { id: true, userId: true },
+        });
+        if (!members.length) break;
+        await pushService.sendToUsers(members.map((member) => member.userId), payload);
+        cursor = members[members.length - 1]!.id;
+        if (members.length < BATCH) break;
+      }
       return;
     }
 
@@ -480,21 +500,23 @@ export const notificationWorker = new Worker(
       const pushTitle = named.title;
       const pushBody = named.body;
       for (let i = 0; i < userIds.length; i += BATCH) {
-        const chunk = userIds.slice(i, i + BATCH).map((userId) => ({
-          userId,
-          type: 'SYSTEM' as const,
+        const chunkIds = userIds.slice(i, i + BATCH);
+        await prisma.notification.createMany({
+          data: chunkIds.map((userId) => ({
+            userId,
+            type: 'SYSTEM' as const,
+            title: pushTitle,
+            body: pushBody,
+            data,
+          })),
+        });
+        await pushService.sendToUsers(chunkIds, {
           title: pushTitle,
           body: pushBody,
           data,
-        }));
-        await prisma.notification.createMany({ data: chunk });
+          threadId: `audio-room:${roomId}`,
+        });
       }
-      await pushService.sendToUsers(userIds, {
-        title: pushTitle,
-        body: pushBody,
-        data,
-        threadId: `audio-room:${roomId}`,
-      });
       logger.info({ jobId: job.id, roomId, notified: userIds.length }, 'Audio room start notification complete');
       return;
     }

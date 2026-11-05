@@ -3,7 +3,7 @@ import { prisma } from '../../infra/db';
 import { NotFound, BadRequest, Forbidden } from '../../utils/errors';
 import { getBulkPresence } from '../chat/chat.socket';
 import { cached, cacheKeys } from '../../infra/cache';
-import { thumbUrl } from '../../utils/cloudinaryUrl';
+import { optimizeImage, thumbUrl } from '../../utils/cloudinaryUrl';
 import { joinChannelRoom } from '../../infra/realtime';
 import { asAdminAuthor, isAnnouncementChannel } from '../../utils/adminAuthor';
 
@@ -251,7 +251,10 @@ export const channelService = {
     });
     const channel = await prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } });
     const present = isAnnouncementChannel(channel) ? asAdminAuthor : <T,>(message: T) => message;
-    return rows.map((m) => ({ ...present(m), thumbUrl: thumbUrl(m.mediaUrl, m.type) }));
+    return rows.map((m) => {
+      const mediaUrl = m.type === 'IMAGE' && m.mediaUrl ? optimizeImage(m.mediaUrl) : m.mediaUrl;
+      return { ...present(m), mediaUrl, thumbUrl: thumbUrl(mediaUrl, m.type) };
+    });
   },
 
   async sharedMedia(userId: string, role: string, channelId: string, cursor?: string, limit = 30) {
@@ -276,7 +279,10 @@ export const channelService = {
     const channel = await prisma.channel.findUnique({ where: { id: channelId }, select: { type: true, name: true } });
     const present = isAnnouncementChannel(channel) ? asAdminAuthor : <T,>(message: T) => message;
     return {
-      items: items.map((m) => ({ ...present(m), thumbUrl: thumbUrl(m.mediaUrl, m.type) })),
+      items: items.map((m) => {
+        const mediaUrl = m.type === 'IMAGE' && m.mediaUrl ? optimizeImage(m.mediaUrl) : m.mediaUrl;
+        return { ...present(m), mediaUrl, thumbUrl: thumbUrl(mediaUrl, m.type) };
+      }),
       nextCursor: items.length === limit ? items[items.length - 1]!.createdAt.toISOString() : null,
     };
   },

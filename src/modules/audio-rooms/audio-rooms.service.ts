@@ -254,13 +254,16 @@ function channelIncomingPayload(room: {
   hostId: string;
   createdAt: Date;
 }, channelName: string, starter: { id: string; displayName: string | null; avatarUrl: string | null }) {
+  const callerName = starter.displayName?.trim() || 'Someone';
   return {
     roomId: room.id,
     channelId: room.channelId,
     title: room.title,
     channelName,
     startedById: starter.id,
-    startedByName: starter.displayName ?? 'Someone',
+    startedByName: callerName,
+    callerName,
+    callerAvatarUrl: starter.avatarUrl ?? '',
     startedByAvatarUrl: starter.avatarUrl,
     createdAt: room.createdAt,
     expiresAt: new Date(room.createdAt.getTime() + CHANNEL_CALL_RING_TTL_MS),
@@ -360,7 +363,7 @@ export const audioRoomService = {
         channelId,
         channelName,
         startedById: userId,
-        startedByName: starter.displayName ?? 'Someone',
+        startedByName: starter.displayName?.trim() || 'Someone',
         startedByAvatarUrl: starter.avatarUrl ?? '',
         createdAt: room.createdAt.toISOString(),
       },

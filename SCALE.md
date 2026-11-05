@@ -46,6 +46,7 @@
 
 5. **Query hotspots.**
    - [x] `GET /channels` unread counts + last message — batched into ~4 queries (was N+1). _(done)_
+   - [x] Church-wide fan-outs (announcements, chat, channel calls, event reminders) read members in pages of 1,000 and look up device tokens in the same size. A push never loads the whole church into one query.
    - If channels get very large, denormalize unread via a counter only if profiling demands it (a naive
      per-member counter reintroduces N×M writes — avoid; the batched query is usually enough).
 

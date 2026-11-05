@@ -115,6 +115,7 @@ When a call starts, every channel member except the starter (and anyone who mute
 
 #### Incoming group call screen
 - Show the channel name and who started the call, with **Join** and **Dismiss** buttons.
+- The person's name is `callerName` (same value as `startedByName`). Do not use the socket `title` for the person — that is the room name. On the push, `data.title` reads "{name} started a call", `data.callerName` is only the name, and the body is the channel name.
 - Close it automatically after 30 seconds.
 - Never show it to the person who started the call.
 

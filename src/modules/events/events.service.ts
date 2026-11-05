@@ -26,7 +26,7 @@ function forMembers<T extends { createdById: string }>(event: T) {
   return { ...rest, postedBy: 'Admin' as const };
 }
 
-function eventPushData(eventId: string, startsAt: Date) {
+function eventPushData(eventId: string, title: string, startsAt: Date) {
   return {
     type: 'event',
     notificationType: 'EVENT',
@@ -35,23 +35,30 @@ function eventPushData(eventId: string, startsAt: Date) {
     clickAction: 'OPEN_EVENT',
     androidChannelId: 'events',
     eventId,
+    eventTitle: title,
     startsAt: startsAt.toISOString(),
     deepLink: `dgc://events/${eventId}`,
   };
 }
 
-function eventReminderBody(startsAt: Date) {
-  const when = new Intl.DateTimeFormat('en-GB', {
+function eventReminderCopy(title: string, startsAt: Date) {
+  const name = title.trim() || 'An event';
+  const day = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Africa/Lagos',
-    weekday: 'short',
+    weekday: 'long',
     day: 'numeric',
-    month: 'short',
+    month: 'long',
+  }).format(startsAt);
+  const time = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Africa/Lagos',
     hour: 'numeric',
     minute: '2-digit',
     hourCycle: 'h12',
-    timeZoneName: 'short',
   }).format(startsAt);
-  return `Starts ${when}. Tap for details.`;
+  return {
+    title: name,
+    body: `${name} is happening on ${day} at ${time}.`,
+  };
 }
 
 // Church-wide events reach every active member. A branch or cluster event reaches that
@@ -278,9 +285,8 @@ export const eventService = {
       });
       if (claimed.count !== 1) continue;
 
-      const title = ev.title;
-      const body = eventReminderBody(ev.startsAt);
-      const data = eventPushData(ev.id, ev.startsAt);
+      const { title, body } = eventReminderCopy(ev.title, ev.startsAt);
+      const data = eventPushData(ev.id, title, ev.startsAt);
       const before = notified;
       try {
         let cursor: string | undefined;

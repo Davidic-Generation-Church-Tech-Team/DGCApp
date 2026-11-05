@@ -102,7 +102,11 @@ describe('event reminders', () => {
     expect(where.user.deletedAt).toBeNull();
     expect(sendToUsers).toHaveBeenCalledWith(
       ['user-1', 'user-2'],
-      expect.objectContaining({ title: 'Workers meeting', body: expect.stringMatching(/^Starts .+ Tap for details\.$/) }),
+      expect.objectContaining({
+        title: 'Workers meeting',
+        body: 'Workers meeting is happening on Sunday 8 November at 10:00 am.',
+        data: expect.objectContaining({ eventTitle: 'Workers meeting', eventId: 'event-1' }),
+      }),
     );
     expect(prisma.user.findMany).not.toHaveBeenCalled();
   });

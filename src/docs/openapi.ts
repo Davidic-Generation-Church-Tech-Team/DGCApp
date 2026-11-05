@@ -974,8 +974,9 @@ registry.registerPath({
     'Media: upload each file first via POST /media/signature { type: "media" } + direct Cloudinary upload, then send ' +
     'the secure_url(s). For an album send attachments: [{ url, width?, height?, bytes? }] (1–10, in display order; pass the bytes Cloudinary returns so size is checked); for one file ' +
     'you may instead send mediaUrl (older single-file form, still supported). Not both. body is optional when media is sent. ' +
-    'Response: attachments[] ({ id, url, type IMAGE/VIDEO/AUDIO/FILE, position, width, height }) ordered by position, ' +
-    'plus mediaUrl = first attachment url and type = first attachment type (TEXT when there is no media). ' +
+    'Response: attachments[] ({ id, url, thumbUrl, type IMAGE/VIDEO/AUDIO/FILE, position, width, height }) ordered by position, ' +
+    'plus mediaUrl = first attachment url, thumbUrl = a small preview, and type = first attachment type (TEXT when there is no media). ' +
+    'Image urls are capped at 1600px and thumbs at 400px, so the list does not download the original upload. Scroll with thumbUrl and load url or mediaUrl only when the picture is opened. ' +
     'The GET feeds return the same shape. sender is always { id: "admin", displayName: "Admin", avatarUrl: null } — ' +
     'the person who posted is not included. Every other active member gets a push: the title and the first image ' +
     'when the announcement has a photo, otherwise the title and the opening of the text. Every media URL must be a ' +
@@ -1500,7 +1501,7 @@ const apiDescription = [
   '**Flow:**',
   '1. Chat mount: `GET /api/v1/channels/:channelId/call` → `{ channelId, live }`. Show a join-call banner when `live` is not null.',
   '2. Start/tap join: `POST /api/v1/channels/:channelId/call/start`. Response includes full audio-room detail + `agora` + `alreadyLive`.',
-  '3. Incoming ring: listen for `audio-room:incoming` or handle FCM payloads where `notificationType=CALL`, `callKind=CHANNEL_AUDIO_ROOM`, `roomId`, `channelId`, `channelName`, and caller fields are present. The notification title is the starter\'s name (`callerName`); `channelName` is the place. Tap should open the channel call and join with `POST /api/v1/audio-rooms/:roomId/join` or the channel start endpoint.',
+  '3. Incoming ring: listen for `audio-room:incoming` or handle FCM payloads where `notificationType=CALL`, `callKind=CHANNEL_AUDIO_ROOM`, `roomId`, `channelId`, `channelName`, and caller fields are present. The notification title is "{name} started a call". `callerName` is the name only, and the body is the channel name. Tap should open the channel call and join with `POST /api/v1/audio-rooms/:roomId/join` or the channel start endpoint.',
   '',
   '### Global Prayer Watch (singleton channel + live prayer call)',
   '',
@@ -1510,7 +1511,7 @@ const apiDescription = [
   '- Any authenticated member can start a call (`POST /prayer-watch/start`). Only one active call at a time — a second Start attaches you to the existing call as a SPEAKER instead of creating a duplicate.',
   '- The call stays live even if the starter leaves. It auto-ends only when the **last** participant leaves.',
   '- The starter is HOST for the duration they\'re in the call. Prayer Warriors cluster moderators (and super admins) can moderate (mute/promote/kick) regardless of whether they started it, and can force-end via `POST /prayer-watch/:roomId/end`.',
-  '- On start, the server fan-outs a push whose title is the starter\'s name and whose body is "Prayer Watch is live". Payloads include `callerId`, `callerName`, `callerAvatarUrl`, `route=PRAYER_WATCH`, `screen=PRAYER_WATCH`, `clickAction=OPEN_PRAYER_WATCH`, `roomId`, `channelId`, and `deepLink=dgc://prayer-watch/rooms/{roomId}`.',
+  '- On start, the server fan-outs a push whose title is "{name} started a call" and whose body is "Prayer Watch". Payloads include `title`, `callerName` (the name only), `callerId`, `callerAvatarUrl`, `route=PRAYER_WATCH`, `screen=PRAYER_WATCH`, `clickAction=OPEN_PRAYER_WATCH`, `roomId`, `channelId`, and `deepLink=dgc://prayer-watch/rooms/{roomId}`.',
   '',
   '**Flow:**',
   '1. Home mount: `GET /api/v1/prayer-watch` → response `{ channelId, live }`. Show a "Join Prayer Watch" banner when `live` is not null.',

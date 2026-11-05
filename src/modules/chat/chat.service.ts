@@ -10,6 +10,7 @@ import { BadRequest, NotFound, Forbidden } from '../../utils/errors';
 import { optimizeImage, thumbUrl } from '../../utils/cloudinaryUrl';
 import { moderationService } from '../moderation/moderation.service';
 import { asAdminAuthor, isAnnouncementChannel } from '../../utils/adminAuthor';
+import { announcementPushCopy } from '../announcements/announcementPushCopy';
 import type { SendMessageInput, ListMessagesInput } from './chat.schema';
 
 const POLL_SELECT = {
@@ -67,7 +68,8 @@ const MESSAGE_SELECT = {
 // Attach a small preview URL (image thumb / video poster) so lists render fast on slow networks.
 // Applied to every message that leaves the server — REST and socket payloads stay identical.
 function withThumb<T extends { mediaUrl: string | null; type: string }>(m: T): T & { thumbUrl: string | null } {
-  return { ...m, thumbUrl: thumbUrl(m.mediaUrl, m.type) };
+  const mediaUrl = m.type === 'IMAGE' && m.mediaUrl ? optimizeImage(m.mediaUrl) : m.mediaUrl;
+  return { ...m, mediaUrl, thumbUrl: thumbUrl(mediaUrl, m.type) };
 }
 
 // Keyset cursor over (createdAt, id) — stable even when timestamps collide.
@@ -130,10 +132,36 @@ async function findExistingSentMessage(userId: string, channelId: string, messag
   });
 }
 
-function notifyMessageFanout(channelId: string, channelType: string, userId: string, message: MessagePayload, dto: SendMessageInput) {
+function notifyMessageFanout(
+  channelId: string,
+  channelType: string,
+  userId: string,
+  message: MessagePayload,
+  dto: SendMessageInput,
+  announcement = false,
+) {
   const senderName = message.sender.displayName ?? 'Someone';
   const jobBase = { channelId, messageId: message.id, senderId: userId, body: message.body };
-  if (channelType === 'DM') {
+  if (announcement) {
+    const written = message.body?.replace(/\s+/g, ' ').trim() ?? '';
+    const headline =
+      message.title?.trim() || (written.length > 80 ? `${written.slice(0, 80).trimEnd()}…` : written) || 'Announcement';
+    const push = announcementPushCopy({
+      title: headline,
+      body: message.body,
+      imageUrl: message.type === 'IMAGE' ? message.mediaUrl : null,
+      fallback:
+        message.type === 'VIDEO' ? 'Shared a video' : message.type === 'AUDIO' ? 'Shared audio' : message.type === 'FILE' ? 'Shared a file' : null,
+    });
+    enqueue(notificationQueue, 'announcement-fanout', {
+      channelId,
+      messageId: message.id,
+      title: push.title,
+      body: push.body,
+      imageUrl: push.imageUrl,
+      excludeUserId: userId,
+    });
+  } else if (channelType === 'DM') {
     enqueue(notificationQueue, 'dm-notify', { ...jobBase, senderName: message.sender.displayName ?? 'New message' });
   } else {
     enqueue(notificationQueue, 'message-fanout', { ...jobBase, senderName });
@@ -263,7 +291,14 @@ export const chatService = {
       // fails, the socket delivery already happened; log and move on. This shaves 10-20ms off
       // the send round trip AND lets the socket emit reach the recipient sooner because we're
       // not holding a Redis connection ahead of it.
-      notifyMessageFanout(channelId, result.channelType, userId, shown, dto);
+      notifyMessageFanout(
+        channelId,
+        result.channelType,
+        userId,
+        shown,
+        dto,
+        isAnnouncementChannel({ type: result.channelType, name: result.channelName }),
+      );
     }
     return decorated;
   },
