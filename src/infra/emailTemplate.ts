@@ -94,8 +94,8 @@ export function resetOtpEmail(code: string): { subject: string; html: string; te
   };
 }
 
-// Keep this as a GIF. f_auto would turn it into a still picture and the confetti would stop.
-const CONFETTI_URL = 'https://res.cloudinary.com/ph82hmab/image/upload/v1793812481/dgc/email/birthday-confetti.gif';
+// A looping burst. Leave this as a GIF with no f_auto, or Cloudinary serves one still frame.
+const CONFETTI_URL = 'https://res.cloudinary.com/ph82hmab/image/upload/v1793901777/dgc/email/birthday-confetti.gif';
 
 function escapeHtml(value: string) {
   return value
