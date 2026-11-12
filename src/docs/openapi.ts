@@ -24,7 +24,7 @@ import { createEventSchema, updateEventSchema, rsvpSchema } from '../modules/eve
 import { createBranchSchema, setRoleSchema, assignUserSchema } from '../modules/admin/admin.schema';
 import { submitCertificateSchema, adminVerifyRequirementSchema, rejectCertificateSchema } from '../modules/growth/growth.schema';
 import { postAnnouncementSchema, announcementAdminSchema } from '../modules/announcements/announcements.schema';
-import { createRoomSchema, updateRoomSchema, promoteSchema } from '../modules/audio-rooms/audio-rooms.schema';
+import { createRoomSchema, updateRoomSchema, promoteSchema, micSchema } from '../modules/audio-rooms/audio-rooms.schema';
 import { initiateCallSchema, listCallsSchema } from '../modules/calls/calls.schema';
 
 export const registry = new OpenAPIRegistry();
@@ -325,7 +325,7 @@ registry.registerPath({
   method: 'post',
   path: '/api/v1/channels/{channelId}/call/start',
   tags: ['channels'],
-  summary: 'Start or join a live group call in this channel. Rings only non-muted members of this channel. Everyone joins as HOST/SPEAKER with a publisher token, like Prayer Watch. Starting a NEW call is limited to once per user per channel every 2 minutes (429); joining a live call is not limited.',
+  summary: 'Start or join a live group call in this channel. Rings only non-muted members of this channel. Without preferPlayback, everyone joins as HOST/SPEAKER with a publisher token. With preferPlayback: true, the starter and admins get a mic and listeners get playbackUrl and agora: null. Starting a NEW call is limited to once per user per channel every 2 minutes (429); joining a live call is not limited.',
   security: bearer,
   request: { params: z.object({ channelId: z.string() }) },
   responses: { 201: { description: 'Audio room detail + Agora credentials + alreadyLive flag', ...json(z.object({}).passthrough()) } },
@@ -1160,6 +1160,18 @@ registry.registerPath({
 });
 registry.registerPath({
   method: 'post',
+  path: '/api/v1/audio-rooms/{roomId}/mic',
+  tags: ['audio-rooms'],
+  summary: 'Grab or return a free mic on Prayer Watch or a channel call. Body { hold: true } takes a free slot (three member mics besides the starter and admins). { hold: false } closes that Agora line and returns playbackUrl. A protected mic cannot be taken.',
+  security: bearer,
+  request: { params: z.object({ roomId: z.string() }), body: json(micSchema) },
+  responses: {
+    200: { description: 'Mic updated. agora is set when hold is true. playbackUrl is set when the station is up and the mic was returned.', ...json(z.object({}).passthrough()) },
+    400: { description: 'All free mics are in use, or the last person tried to put the mic down', ...json(errorSchema) },
+  },
+});
+registry.registerPath({
+  method: 'post',
   path: '/api/v1/audio-rooms/{roomId}/step-down',
   tags: ['audio-rooms'],
   summary: 'Speaker demotes themselves to LISTENER. Returns a fresh audience-role Agora token.',
@@ -1171,7 +1183,7 @@ registry.registerPath({
   method: 'post',
   path: '/api/v1/audio-rooms/{roomId}/participants/{userId}/mute',
   tags: ['audio-rooms'],
-  summary: 'Soft-mute a HOST/SPEAKER. Broadcasts audio-room:user-muted; the target receives audio-room:muted and is expected to honor it client-side.',
+  summary: 'Mute a HOST/SPEAKER. On a crowd call with a station this removes them from the call and sends audio-room:playback. Named rooms stay a soft mute. A member cannot take the starter, a super admin, or an admin mic.',
   security: bearer,
   request: { params: z.object({ roomId: z.string(), userId: z.string() }) },
   responses: { 200: { description: 'Mute signal sent', ...json(okSchema) } },
@@ -1207,7 +1219,14 @@ registry.registerPath({
       description: 'Channel id + live call state',
       ...json(z.object({
         channelId: z.string(),
-        live: z.object({ id: z.string(), title: z.string(), hostId: z.string(), startedAt: z.string().nullable(), createdAt: z.string() }).nullable(),
+        live: z.object({
+          id: z.string(),
+          title: z.string(),
+          hostId: z.string(),
+          playbackUrl: z.string().nullable(),
+          startedAt: z.string().nullable(),
+          createdAt: z.string(),
+        }).nullable(),
       })),
     },
   },
@@ -1216,7 +1235,7 @@ registry.registerPath({
   method: 'post',
   path: '/api/v1/prayer-watch/start',
   tags: ['prayer-watch'],
-  summary: 'Any member starts the Global Prayer Watch call. Idempotent — if one is already live, attaches the caller and returns the existing room + Agora token. A new call pushes the starter\'s name to every user.',
+  summary: 'Any member starts the Global Prayer Watch call. Idempotent — if one is already live, attaches the caller. Optional body { preferPlayback: true } puts members on the station (playbackUrl, agora null) and keeps a mic for the starter and admins. Without that flag everyone still receives a publisher token. A new call pushes the starter\'s name to every user.',
   security: bearer,
   responses: {
     201: {
@@ -1442,7 +1461,8 @@ const apiDescription = [
   '| `audio-room:muted` | listen | `{ roomId, mutedBy }` — sent to the muted user; client is expected to mute its local mic |',
   '| `audio-room:user-muted` | listen | `{ roomId, userId, mutedBy }` — broadcast so the whole room UI reflects the mute state |',
   '| `audio-room:user-unmuted` | listen | `{ roomId, userId }` — broadcast so the whole room UI clears the mute state |',
-  '| `audio-room:token` | listen | `{ roomId, appId, token, channel, uid }` (sent when promoted to speaker, or on step-down as an audience token) |',
+  '| `audio-room:token` | listen | `{ roomId, appId, token, channel, uid }` (sent when someone receives a mic). Join Agora and stop the station player. |',
+  '| `audio-room:playback` | listen | `{ roomId, playbackUrl }` sent to the person who put a mic down or had it taken, and once to the channel when the station link is refreshed. Mic holders are skipped on refresh. Leave Agora and play playbackUrl. Ignore it unless you are already playing that roomId. |',
   '',
   'Sending a message is a REST call (`POST /api/v1/channels/{channelId}/messages`); the server then broadcasts `message:new` to the channel room.',
   '',
@@ -1496,7 +1516,9 @@ const apiDescription = [
   '**Call rules:**',
   '- Only channel members can see/join the channel call. Read-only channels require a channel moderator/admin or super admin to start the call.',
   '- The room is persistent like Prayer Watch: it stays live if the starter leaves and ends only when the last participant leaves, or when a moderator ends it.',
-  '- Everyone joins as HOST/SPEAKER with publisher Agora credentials, like Global Prayer Watch.',
+  '- Phones that do not send `preferPlayback` still join as HOST/SPEAKER with a publisher token.',
+  '- A phone that sends `{ "preferPlayback": true }` on start or join: the starter and admins get `agora` and `role` HOST or SPEAKER and are added to the call. A member gets `role: LISTENER`, `agora: null`, and `playbackUrl`, and is not added to the call. If the station failed, `playbackUrl` is null and they are not given an Agora token.',
+  '- `POST /audio-rooms/:id/mic` with `{ "hold": true }` is what adds a listener to the call and picks up a free mic (at most three members besides the starter and admins). `{ "hold": false }` removes them from the call. The response and `audio-room:token` / `audio-room:playback` tell the phone which path to use.',
   '- On new call start, the server emits `audio-room:incoming` to the channel socket room, excluding the starter, and sends call-style FCM only to non-muted members of that channel, excluding the starter.',
   '- Ending the call emits `audio-room:ended` to the channel as well as the call, drops the ring job, and refuses a new start in that channel for 30 seconds with "This call has ended". A join that finds the call already over does not open a replacement call.',
   '',
@@ -1510,8 +1532,9 @@ const apiDescription = [
   '**"DGC Global Prayer Watch"** is a singleton channel every user is auto-joined to during onboarding (alongside "DGC Global Announcement"). Existing users were backfilled. It works as an ordinary chat channel — send messages via the standard `POST /channels/:channelId/messages` — AND members can spin up a live prayer audio call inside it whenever none is currently live.',
   '',
   '**Call rules:**',
-  '- Any authenticated member can start a call (`POST /prayer-watch/start`). Only one active call at a time — a second Start attaches you to the existing call as a SPEAKER instead of creating a duplicate.',
-  '- The call stays live even if the starter leaves. It auto-ends only when the **last** participant leaves.',
+  '- Any authenticated member can start a call (`POST /prayer-watch/start`). Only one active call at a time — a second Start attaches you to the existing call instead of creating a duplicate.',
+  '- The home banner can read `live.playbackUrl` and play the station without joining the call. Sending `preferPlayback: true` on start or join opts that phone into listener rules and does not add a member to the roll. `POST /audio-rooms/:id/mic` is what adds them.',
+  '- The call stays live even if the starter leaves. It auto-ends only when the last person on the roll leaves. Listeners playing the station are not on the roll.',
   '- The starter is HOST for the duration they\'re in the call. Prayer Warriors cluster moderators (and super admins) can moderate (mute/promote/kick) regardless of whether they started it, and can force-end via `POST /prayer-watch/:roomId/end`.',
   '- On start, the server fan-outs a push whose title is "{name} started a call" and whose body is "Prayer Watch". Payloads include `title`, `callerName` (the name only), `callerId`, `callerAvatarUrl`, `route=PRAYER_WATCH`, `screen=PRAYER_WATCH`, `clickAction=OPEN_PRAYER_WATCH`, `roomId`, `channelId`, and `deepLink=dgc://prayer-watch/rooms/{roomId}`.',
   '',

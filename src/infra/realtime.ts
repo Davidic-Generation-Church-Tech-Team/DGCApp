@@ -69,3 +69,11 @@ export function emitCallEnded(roomId: string, channelId: string | null) {
   io?.to(callRoom).emit('audio-room:ended', payload);
   closeAudioRoom(roomId);
 }
+
+// One new station link for people listening in the channel. Sockets already on a mic are in
+// the call room, so they are skipped and stay on Agora.
+export function emitPlaybackToCrowd(roomId: string, channelId: string | null, playbackUrl: string) {
+  if (!channelId) return;
+  const callRoom = audioRoomName(roomId);
+  io?.to(channelRoomName(channelId)).except(callRoom).emit('audio-room:playback', { roomId, playbackUrl });
+}

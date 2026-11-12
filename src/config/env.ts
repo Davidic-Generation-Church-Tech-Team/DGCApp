@@ -46,6 +46,14 @@ const schema = z.object({
   TERMII_BASE_URL: z.string().default('https://api.ng.termii.com'),
   AGORA_APP_ID: z.string().optional(),
   AGORA_APP_CERTIFICATE: z.string().optional(),
+  // Media Push (server REST). Mixes the mic table into one RTMP stream. Unused until set.
+  AGORA_CUSTOMER_KEY: optionalString,
+  AGORA_CUSTOMER_SECRET: optionalString,
+  // Converter region: cn, ap, eu, or na. Empty follows the Bunny ingest region.
+  AGORA_MEDIA_PUSH_REGION: optionalString,
+  // Bunny Stream library where live ingest is enabled. The API key is that library's AccessKey.
+  BUNNY_STREAM_LIBRARY_ID: optionalString,
+  BUNNY_STREAM_API_KEY: optionalString,
   CORS_ORIGIN: z.string().default('*'),
   METRICS_TOKEN: z.string().optional(),
   SENTRY_DSN: optionalUrl,

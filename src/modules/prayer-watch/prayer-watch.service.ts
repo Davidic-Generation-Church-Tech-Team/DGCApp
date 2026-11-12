@@ -1,20 +1,12 @@
 import { prisma } from '../../infra/db';
-import { joinAudioRoom, emitToAudioRoom, emitToUser } from '../../infra/realtime';
+import { joinAudioRoom } from '../../infra/realtime';
 import { notificationQueue } from '../../infra/queue';
 import { enqueue } from '../../infra/enqueue';
 import { redis, withDeadline } from '../../infra/redis';
-import { addParticipantIfLive, audioRoomService, callJustEnded, publishRoomEnded, stableUid } from '../audio-rooms/audio-rooms.service';
+import { audioRoomService, callJustEnded, publishRoomEnded } from '../audio-rooms/audio-rooms.service';
+import { openStation } from '../audio-rooms/station';
 import { isClusterModerator } from '../../utils/authorization';
 import { BadRequest, Forbidden, NotFound } from '../../utils/errors';
-
-// Shape must match audio-rooms.service.PARTICIPANT_SELECT so all clients render the same fields.
-const PARTICIPANT_SELECT = {
-  id: true,
-  userId: true,
-  role: true,
-  joinedAt: true,
-  user: { select: { id: true, displayName: true, avatarUrl: true } },
-} as const;
 
 // PRD clarification: Global Prayer Watch is a singleton channel every user is auto-joined to.
 // It works as an ordinary chat channel PLUS members can spin up a live prayer audio call inside
@@ -55,7 +47,18 @@ async function findLiveRoom() {
   return prisma.audioRoom.findFirst({
     where: { type: 'PRAYER_WATCH', status: 'LIVE' },
     orderBy: { startedAt: 'desc' },
-    select: { id: true, title: true, hostId: true, startedAt: true, createdAt: true },
+    select: {
+      id: true,
+      title: true,
+      hostId: true,
+      channelId: true,
+      branchId: true,
+      clusterId: true,
+      type: true,
+      playbackUrl: true,
+      startedAt: true,
+      createdAt: true,
+    },
   });
 }
 
@@ -65,16 +68,25 @@ export const prayerWatchService = {
   async status() {
     const channel = await findGlobalPrayerWatchChannel();
     const live = await findLiveRoom();
-    return { channelId: channel.id, live };
+    if (!live) return { channelId: channel.id, live: null };
+    return {
+      channelId: channel.id,
+      live: {
+        id: live.id,
+        title: live.title,
+        hostId: live.hostId,
+        playbackUrl: live.playbackUrl,
+        startedAt: live.startedAt,
+        createdAt: live.createdAt,
+      },
+    };
   },
 
   // Any authenticated user can start a call — but only when none is currently live. If a call
-  // is already live, we attach the caller. Prayer Watch is Telegram-voice-chat style: every
-  // participant is a SPEAKER by default, with a publisher Agora token, and can unmute and
-  // speak immediately. There is no LISTENER role in a Prayer Watch call. Admins/moderators
-  // can KICK disruptive participants (see audio-rooms.service.kick — canModerateRoom broadened
-  // for PRAYER_WATCH to include any admin/mod).
-  async start(userId: string, _role: string) {
+  // is already live, we attach the caller. Phones that omit preferPlayback still join as
+  // speakers with a publisher token. A phone that sends it keeps a mic for the starter and
+  // for admins. Everyone else gets the station link and is not added to the call roll.
+  async start(userId: string, role: string, preferPlayback = false) {
     const channel = await findGlobalPrayerWatchChannel(); // ensures the channel exists — catches misconfigured envs
 
     // Cross-request mutex so two simultaneous starters don't both create a live room. The
@@ -120,39 +132,7 @@ export const prayerWatchService = {
       if (holdsLock) {
         redis.del(LOCK_KEY).catch(() => {}); // best-effort release
       }
-      const p = await prisma.audioRoomParticipant.findFirst({
-        where: { roomId: existing.id, userId, leftAt: null },
-        select: { id: true, role: true },
-      });
-      if (!p) {
-        // Fresh join → SPEAKER for everyone.
-        // If the last person ended it under us, do not open a replacement call.
-        let created;
-        try {
-          created = await addParticipantIfLive(existing.id, userId, 'SPEAKER');
-        } catch (err) {
-          if ((err as { message?: string }).message === 'Room is not live') {
-            throw BadRequest('This call has ended');
-          }
-          throw err;
-        }
-        joinAudioRoom(userId, existing.id);
-        emitToAudioRoom(existing.id, 'audio-room:user-joined', { ...created, agoraUid: stableUid(userId) });
-      } else if (p.role === 'LISTENER') {
-        // Transitional: anyone already in the room as a LISTENER (from a previous deploy's
-        // rules) is upgraded to SPEAKER on their next rejoin so they can speak.
-        await prisma.audioRoomParticipant.update({ where: { id: p.id }, data: { role: 'SPEAKER' } });
-        emitToAudioRoom(existing.id, 'audio-room:role-changed', {
-          roomId: existing.id, userId, role: 'SPEAKER',
-        });
-      }
-      // Everyone in Prayer Watch is a publisher — always issue a host-role Agora token.
-      const token = audioRoomService.issueToken(existing.id, userId, 'host');
-      // Push the fresh token through the socket too, so a mid-call upgrade renews without an
-      // extra REST call — client can just engine.renewToken().
-      emitToUser(userId, 'audio-room:token', { roomId: existing.id, ...token });
-      const detail = await audioRoomService.get(userId, existing.id);
-      return { ...detail, agora: token, alreadyLive: true };
+      return audioRoomService.joinLiveCrowdCall(userId, role, existing, undefined, preferPlayback);
     }
 
     // No live call — create one. Starter is HOST; room is persistent so it survives the starter
@@ -206,9 +186,16 @@ export const prayerWatchService = {
       },
       { jobId: `prayer-watch-live-${room.id}` },
     );
+    await openStation(room.id, room.title);
 
     const detail = await audioRoomService.get(userId, room.id);
-    return { ...detail, agora: audioRoomService.issueToken(room.id, userId, 'host'), alreadyLive: false };
+    return {
+      ...detail,
+      role: 'HOST' as const,
+      playbackUrl: detail.playbackUrl ?? null,
+      agora: audioRoomService.issueToken(room.id, userId, 'host'),
+      alreadyLive: false,
+    };
   },
 
   // Force-end: Prayer Warriors moderator or super admin. Ends the call for everyone still on it.

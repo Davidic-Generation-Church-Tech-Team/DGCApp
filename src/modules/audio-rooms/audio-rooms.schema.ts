@@ -19,5 +19,9 @@ export const promoteSchema = z.object({
   role: z.enum(['SPEAKER', 'LISTENER']),
 });
 
+export const micSchema = z.object({
+  hold: z.boolean(),
+});
+
 export type CreateRoomInput = z.infer<typeof createRoomSchema>;
 export type UpdateRoomInput = z.infer<typeof updateRoomSchema>;

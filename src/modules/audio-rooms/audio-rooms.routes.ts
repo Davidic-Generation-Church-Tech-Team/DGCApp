@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate';
 import { validate } from '../../middleware/validate';
 import { asyncHandler } from '../../utils/asyncHandler';
-import { createRoomSchema, updateRoomSchema, promoteSchema } from './audio-rooms.schema';
+import { createRoomSchema, updateRoomSchema, promoteSchema, micSchema } from './audio-rooms.schema';
 import { audioRoomController } from './audio-rooms.controller';
 
 export const audioRoomsRouter = Router();
@@ -21,6 +21,7 @@ audioRoomsRouter.post('/:roomId/remind', authenticate, asyncHandler(audioRoomCon
 audioRoomsRouter.delete('/:roomId/remind', authenticate, asyncHandler(audioRoomController.unremind));
 audioRoomsRouter.post('/:roomId/promote', authenticate, validate(promoteSchema), asyncHandler(audioRoomController.promote));
 audioRoomsRouter.post('/:roomId/step-down', authenticate, asyncHandler(audioRoomController.stepDown));
+audioRoomsRouter.post('/:roomId/mic', authenticate, validate(micSchema), asyncHandler(audioRoomController.setMic));
 audioRoomsRouter.post('/:roomId/mute-all', authenticate, asyncHandler(audioRoomController.muteAll));
 audioRoomsRouter.post('/:roomId/participants/:userId/mute', authenticate, asyncHandler(audioRoomController.mute));
 audioRoomsRouter.post('/:roomId/participants/:userId/unmute', authenticate, asyncHandler(audioRoomController.unmute));

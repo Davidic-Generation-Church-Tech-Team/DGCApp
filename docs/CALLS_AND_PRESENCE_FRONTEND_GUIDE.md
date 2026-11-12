@@ -182,6 +182,29 @@ Errors come back with a status, a short code (such as `FORBIDDEN`) and a message
 - In a read-only channel, ordinary members see no call button but can still join a live call.
 - Closing the app during a call: the user disappears from the call for others within about 5 minutes.
 
+### Station listening (new phones only)
+
+Current phones do not send `preferPlayback`. They keep receiving `agora` and join as speakers, exactly as the rules above describe. Ship this section with the app update. Until that build is in the store, the Agora bill does not drop.
+
+Send `{ "preferPlayback": true }` on:
+
+- `POST /api/v1/channels/:channelId/call/start`
+- `POST /api/v1/prayer-watch/start`
+- `POST /api/v1/audio-rooms/:roomId/join`
+
+The response then includes `role` (`HOST`, `SPEAKER`, or `LISTENER`), `playbackUrl` (the station, or null if it is not up), and `agora`.
+
+- The person who started the call, a super admin, a branch admin, a cluster moderator, and a channel admin or moderator receive `agora`. Join Agora with that token. Do not play `playbackUrl`. They are on the call.
+- Every other member receives `role: LISTENER`, `agora: null`, and `playbackUrl`. Play that link. Do not join Agora. The server does not add them to the call, so the call screen of the people on microphones does not list the crowd. If `playbackUrl` is null, show that the station is not up yet. Do not fall back to Agora.
+- Prefer the banner. `GET /api/v1/prayer-watch` and `GET /api/v1/channels/:channelId/call` include `playbackUrl` on `live` when the station is up. Play that link and do not call join until the person takes a microphone.
+- Picking up a mic: `POST /api/v1/audio-rooms/:roomId/mic` with `{ "hold": true }`. This is what adds the person to the call. At most three members can hold a free mic besides the starter and the admins. A fourth gets "All free mics are in use". On success the response includes `agora`, and the phone also gets `audio-room:token`. Stop the player, then join Agora. The call screen receives `audio-room:user-joined`.
+- Putting the mic down: the same endpoint with `{ "hold": false }`. The person leaves the call. The response and `audio-room:playback` carry `playbackUrl`. Leave Agora and play the link. The call screen receives `audio-room:user-left`. The last person on the call cannot put the mic down; they leave or end the call.
+- A mute of a free mic on these calls also removes that person from the call and sends `audio-room:playback`. The starter, a super admin, and an admin cannot have their mic taken. Named rooms (`GENERAL`) still use the soft mute described above.
+- About once every 11 hours the server replaces the station link and emits `audio-room:playback` once to the channel. Swap the player only if you are already playing that `roomId`. People holding a mic do not receive it.
+- When the service ends, `audio-room:ended` is sent to the channel as well as the call. If you are playing that `roomId`, stop the player.
+- Listeners hear the service about 10 to 15 seconds later than the people holding mics. People on mics hear each other immediately.
+- Chat does not change. Direct calls do not use this. Named rooms do not use this.
+
 ## Part 2: Online status & last seen
 
 This part explains how the app shows who is online, when someone was last seen, and the live list of online users for super admins.

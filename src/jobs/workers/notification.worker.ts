@@ -6,6 +6,7 @@ import { workerOptions } from '../../infra/queue';
 import { captureJobException } from '../../instrument';
 import { eventService } from '../../modules/events/events.service';
 import { audioRoomService } from '../../modules/audio-rooms/audio-rooms.service';
+import { refreshDueStations } from '../../modules/audio-rooms/station';
 import { sweepExpiredPresence } from '../../modules/chat/chat.socket';
 import { callService } from '../../modules/calls/calls.service';
 import { notificationService } from '../../modules/notifications/notifications.service';
@@ -151,6 +152,12 @@ export const notificationWorker = new Worker(
     if (job.name === 'audio-room-phantom-sweep') {
       const result = await audioRoomService.sweepPhantomParticipants();
       if (result.swept && result.swept > 0) logger.info({ jobId: job.id, ...result }, 'Phantom sweep swept participants');
+      return;
+    }
+
+    if (job.name === 'station-refresh') {
+      const result = await refreshDueStations();
+      if (result.refreshed > 0) logger.info({ jobId: job.id, ...result }, 'Live station refreshed');
       return;
     }
 

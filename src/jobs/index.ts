@@ -32,6 +32,11 @@ export function startWorkers() {
     .upsertJobScheduler('audio-room-phantom-sweep', { every: 3 * 60 * 1000 }, { name: 'audio-room-phantom-sweep' })
     .then(() => logger.info('Audio-room phantom-sweep scheduler registered'))
     .catch((err) => logger.error({ err }, 'Failed to register phantom-sweep scheduler'));
+  // Bunny ends one live stream at 12 hours. Refresh a crowd-call station before that.
+  notificationQueue
+    .upsertJobScheduler('station-refresh', { every: 60 * 60 * 1000 }, { name: 'station-refresh' })
+    .then(() => logger.info('Station-refresh scheduler registered'))
+    .catch((err) => logger.error({ err }, 'Failed to register station-refresh scheduler'));
   // Presence sweep: users whose heartbeat lapsed without a clean socket disconnect are marked
   // offline (broadcast + lastSeenAt). With the 120s TTL, they show offline within ~3 minutes.
   notificationQueue

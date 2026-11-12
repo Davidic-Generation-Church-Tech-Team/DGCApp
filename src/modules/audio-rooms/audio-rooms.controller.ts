@@ -20,7 +20,7 @@ export const audioRoomController = {
   },
   async startChannelCall(req: Request, res: Response) {
     res.status(201).json(await audioRoomService.startChannelCall(
-      req.user!.sub, req.user!.role, req.params.channelId as string,
+      req.user!.sub, req.user!.role, req.params.channelId as string, req.body?.preferPlayback === true,
     ));
   },
   async remind(req: Request, res: Response) {
@@ -36,7 +36,9 @@ export const audioRoomController = {
     res.json(await audioRoomService.end(req.user!.sub, req.user!.role, req.params.roomId as string));
   },
   async join(req: Request, res: Response) {
-    res.json(await audioRoomService.join(req.user!.sub, req.user!.role, req.params.roomId as string));
+    res.json(await audioRoomService.join(
+      req.user!.sub, req.user!.role, req.params.roomId as string, req.body?.preferPlayback === true,
+    ));
   },
   async leave(req: Request, res: Response) {
     res.json(await audioRoomService.leave(req.user!.sub, req.params.roomId as string));
@@ -55,6 +57,11 @@ export const audioRoomController = {
   },
   async kick(req: Request, res: Response) {
     res.json(await audioRoomService.kick(req.user!.sub, req.user!.role, req.params.roomId as string, req.params.userId as string));
+  },
+  async setMic(req: Request, res: Response) {
+    res.json(await audioRoomService.setMic(
+      req.user!.sub, req.user!.role, req.params.roomId as string, req.body.hold,
+    ));
   },
   async stepDown(req: Request, res: Response) {
     res.json(await audioRoomService.stepDown(req.user!.sub, req.params.roomId as string));

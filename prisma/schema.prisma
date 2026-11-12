@@ -714,6 +714,12 @@ model AudioRoom {
   isPersistent   Boolean         @default(false)
   provider       String? // "agora" | "100ms"
   externalRoomId String?
+  // Crowd-call station (Prayer Watch and channel calls). playbackUrl is safe to return.
+  // bunnyStreamId and agoraConverterId stay on the server. The stream key is not stored.
+  playbackUrl      String?
+  bunnyStreamId    String?
+  agoraConverterId String?
+  stationStartedAt DateTime?
   scheduledFor   DateTime?
   reminderSentAt DateTime? // pre-start reminder scan marker (same pattern as Event.reminderSentAt)
   startedAt      DateTime?

@@ -6,7 +6,9 @@ export const prayerWatchController = {
     res.json(await prayerWatchService.status());
   },
   async start(req: Request, res: Response) {
-    res.status(201).json(await prayerWatchService.start(req.user!.sub, req.user!.role));
+    res.status(201).json(await prayerWatchService.start(
+      req.user!.sub, req.user!.role, req.body?.preferPlayback === true,
+    ));
   },
   async end(req: Request, res: Response) {
     res.json(await prayerWatchService.end(req.user!.sub, req.user!.role, req.params.roomId as string));
