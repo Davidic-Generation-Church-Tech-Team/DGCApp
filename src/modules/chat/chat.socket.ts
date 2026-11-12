@@ -375,7 +375,7 @@ export function registerSocketHandlers(io: Server) {
           prisma.channelMembership.findMany({ where: { userId }, select: { channelId: true } }),
           prisma.audioRoomParticipant.findMany({
             where: { userId, leftAt: null, room: { status: 'LIVE' } },
-            select: { roomId: true },
+            select: { roomId: true, role: true, room: { select: { type: true } } },
           }),
           prisma.channelMembership.findMany({
             where: { userId: { not: userId }, channel: { type: 'DM', memberships: { some: { userId } } } },
@@ -385,28 +385,52 @@ export function registerSocketHandlers(io: Server) {
         ]);
         displayName = user?.displayName ?? null;
         for (const m of memberships) socket.join(`channel:${m.channelId}`);
-        for (const r of audioRooms) socket.join(`audio-room:${r.roomId}`);
+        // Crowd-call listeners stay out of the speaker socket. A join must not fan out to the whole congregation.
+        const speakerRooms = audioRooms.filter((r) =>
+          r.role !== 'LISTENER' || (r.room.type !== 'PRAYER_WATCH' && r.room.type !== 'CHANNEL_CALL'),
+        );
+        for (const r of speakerRooms) socket.join(`audio-room:${r.roomId}`);
         socket.join(dmPeers.map((p) => PRESENCE_WATCH_ROOM(p.userId)));
 
-        // Catch-up state: for every active audio room the user is a participant in, emit the
-        // current live participant list to THIS socket. Guards against the socket-reconnect race
-        // where a user-joined event fires during the ~200-500ms window between the handshake
-        // completing and this handler joining the audio-room socket room — that event would
-        // otherwise be missed forever, leaving the observer with a stale participant list.
-        if (audioRooms.length) {
-          const roomIds = audioRooms.map((r) => r.roomId);
-          const participants = await prisma.audioRoomParticipant.findMany({
-            where: { roomId: { in: roomIds }, leftAt: null },
-            select: {
-              id: true,
-              roomId: true,
-              userId: true,
-              role: true,
-              joinedAt: true,
-              user: { select: { id: true, displayName: true, avatarUrl: true } },
-            },
-            orderBy: [{ role: 'asc' }, { joinedAt: 'asc' }],
-          });
+        // Catch-up state: for every room where this socket sits with the speakers, emit who can speak.
+        // A crowd call sends a listener count instead of every muted member.
+        if (speakerRooms.length) {
+          const openMicIds = speakerRooms
+            .filter((r) => r.room.type === 'PRAYER_WATCH' || r.room.type === 'CHANNEL_CALL')
+            .map((r) => r.roomId);
+          const otherIds = speakerRooms
+            .filter((r) => r.room.type !== 'PRAYER_WATCH' && r.room.type !== 'CHANNEL_CALL')
+            .map((r) => r.roomId);
+          const roomIds = speakerRooms.map((r) => r.roomId);
+          const participantWhere = {
+            leftAt: null,
+            OR: [
+              ...(openMicIds.length ? [{ roomId: { in: openMicIds }, role: { in: ['HOST', 'SPEAKER'] as ('HOST' | 'SPEAKER')[] } }] : []),
+              ...(otherIds.length ? [{ roomId: { in: otherIds } }] : []),
+            ],
+          };
+          const [participants, listenerRows] = await Promise.all([
+            prisma.audioRoomParticipant.findMany({
+              where: participantWhere,
+              select: {
+                id: true,
+                roomId: true,
+                userId: true,
+                role: true,
+                joinedAt: true,
+                user: { select: { id: true, displayName: true, avatarUrl: true } },
+              },
+              orderBy: [{ role: 'asc' }, { joinedAt: 'asc' }],
+            }),
+            openMicIds.length
+              ? prisma.audioRoomParticipant.groupBy({
+                  by: ['roomId'],
+                  where: { roomId: { in: openMicIds }, leftAt: null, role: 'LISTENER' },
+                  _count: { _all: true },
+                })
+              : Promise.resolve([]),
+          ]);
+          const listenerCounts = new Map(listenerRows.map((row) => [row.roomId, row._count._all]));
           const byRoom = new Map<string, typeof participants>();
           for (const p of participants) {
             const arr = byRoom.get(p.roomId) ?? [];
@@ -415,7 +439,12 @@ export function registerSocketHandlers(io: Server) {
           }
           for (const roomId of roomIds) {
             const roomParticipants = (byRoom.get(roomId) ?? []).map((p) => ({ ...p, agoraUid: stableUid(p.userId) }));
-            socket.emit('audio-room:state', { roomId, participants: roomParticipants });
+            const listenerCount = listenerCounts.get(roomId);
+            socket.emit('audio-room:state', {
+              roomId,
+              participants: roomParticipants,
+              ...(listenerCount !== undefined ? { listenerCount } : {}),
+            });
           }
         }
       } catch (err) {

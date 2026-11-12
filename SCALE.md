@@ -47,7 +47,7 @@
 5. **Query hotspots.**
    - [x] `GET /channels` unread counts + last message — batched into ~4 queries (was N+1). _(done)_
    - [x] Church-wide fan-outs (announcements, chat, channel calls, event reminders, new events) read members in pages of 1,000 and look up device tokens in the same size. A new-event push saves the last finished page on the job, so a retry continues there. A push never loads the whole church into one query.
-   - [x] One Agora Media Push per live Prayer Watch or channel call. Listeners who opt into the station are not Agora participants and are not written into the call roster. They play `live.playbackUrl`. `POST /mic` is what adds them.
+   - [x] One Agora Media Push per live Prayer Watch or channel call. Members who join with the station are in the call, muted, and are not Agora participants. The speaker socket receives a listener count, not one shout per listener. `POST /mic` unmutes and mutes.
    - If channels get very large, denormalize unread via a counter only if profiling demands it (a naive
      per-member counter reintroduces N×M writes — avoid; the batched query is usually enough).
 

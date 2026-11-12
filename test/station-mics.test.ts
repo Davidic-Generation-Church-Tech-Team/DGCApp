@@ -174,9 +174,16 @@ describe('crowd-call station', () => {
     expect(joined.role).toBe('LISTENER');
     expect(joined.agora).toBeNull();
     expect(joined.playbackUrl).toBe(PLAYBACK);
-    expect(prisma.audioRoomParticipant.create).not.toHaveBeenCalled();
+    expect(prisma.audioRoomParticipant.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ userId: 'member', role: 'LISTENER' }) }),
+    );
     expect(joinAudioRoom).not.toHaveBeenCalled();
-    expect(emitToAudioRoom).not.toHaveBeenCalled();
+    expect(emitToAudioRoom).toHaveBeenCalledWith(
+      'room-1',
+      'audio-room:listeners',
+      expect.objectContaining({ roomId: 'room-1' }),
+    );
+    expect(emitToAudioRoom).not.toHaveBeenCalledWith('room-1', 'audio-room:user-joined', expect.anything());
   });
 
   it('gives the starter and an admin an Agora token', async () => {
@@ -225,7 +232,10 @@ describe('crowd-call station', () => {
     const joined = await prayerWatchService.start('member', 'MEMBER', true) as { agora: unknown; playbackUrl: string | null };
     expect(joined.agora).toBeNull();
     expect(joined.playbackUrl).toBeNull();
-    expect(prisma.audioRoomParticipant.create).not.toHaveBeenCalled();
+    expect(prisma.audioRoomParticipant.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ role: 'LISTENER' }) }),
+    );
+    expect(joinAudioRoom).not.toHaveBeenCalled();
   });
 
   it('refuses a fourth free mic and frees the slot when one is put down', async () => {
@@ -251,10 +261,12 @@ describe('crowd-call station', () => {
       playbackUrl: PLAYBACK,
     });
     expect(prisma.audioRoomParticipant.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'p-m1' }, data: { leftAt: expect.any(Date) } }),
+      expect.objectContaining({ where: { id: 'p-m1' }, data: { role: 'LISTENER' } }),
     );
     expect(leaveAudioRoom).toHaveBeenCalledWith('m1', 'room-1');
-    expect(emitToAudioRoom).toHaveBeenCalledWith('room-1', 'audio-room:user-left', { roomId: 'room-1', userId: 'm1' });
+    expect(emitToAudioRoom).toHaveBeenCalledWith('room-1', 'audio-room:role-changed', {
+      roomId: 'room-1', userId: 'm1', role: 'LISTENER',
+    });
 
     prisma.audioRoomParticipant.findFirst.mockResolvedValue(person('m4', 'LISTENER'));
     prisma.audioRoomParticipant.findMany.mockResolvedValue(holders.slice(0, 2));
@@ -285,7 +297,7 @@ describe('crowd-call station', () => {
     prisma.audioRoomParticipant.count.mockResolvedValue(2);
     await expect(audioRoomService.mute('starter', 'MEMBER', 'room-1', 'guest')).resolves.toMatchObject({ ok: true });
     expect(prisma.audioRoomParticipant.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'p-guest' }, data: { leftAt: expect.any(Date) } }),
+      expect.objectContaining({ where: { id: 'p-guest' }, data: { role: 'LISTENER' } }),
     );
     expect(leaveAudioRoom).toHaveBeenCalledWith('guest', 'room-1');
     expect(emitToUser).toHaveBeenCalledWith('guest', 'audio-room:playback', {
@@ -320,16 +332,21 @@ describe('crowd-call station', () => {
     expect(methods).toContain('PUT');
   });
 
-  it('adds a listener to the roll only when they take a mic', async () => {
+  it('requires a join before the mic, then unmute seats the member with the speakers', async () => {
     prisma.audioRoom.findUnique.mockResolvedValue({ ...liveRoom(), status: 'LIVE' });
     prisma.audioRoomParticipant.findFirst.mockResolvedValue(null);
-    prisma.audioRoomParticipant.create.mockResolvedValue(person('member', 'SPEAKER'));
 
+    await expect(audioRoomService.setMic('member', 'MEMBER', 'room-1', true)).rejects.toMatchObject({
+      message: 'Join the call before using the mic',
+      status: 400,
+    });
+
+    prisma.audioRoomParticipant.findFirst.mockResolvedValue(person('member', 'LISTENER'));
     const grabbed = await audioRoomService.setMic('member', 'MEMBER', 'room-1', true);
     expect(grabbed.role).toBe('SPEAKER');
     expect(grabbed.agora?.token).toBe('publisher-token');
-    expect(prisma.audioRoomParticipant.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ userId: 'member', role: 'SPEAKER' }) }),
+    expect(prisma.audioRoomParticipant.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'p-member' }, data: { role: 'SPEAKER' } }),
     );
     expect(joinAudioRoom).toHaveBeenCalledWith('member', 'room-1');
     expect(emitToAudioRoom).toHaveBeenCalledWith(

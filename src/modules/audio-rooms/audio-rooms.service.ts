@@ -129,8 +129,9 @@ function emitPlayback(userId: string, roomId: string, playbackUrl: string | null
 
 const LAST_MIC_MESSAGE = 'The last person on the call keeps the mic';
 
-// A phone that opts into the station is not a person on the call. No row, no socket, no shout.
-function listensOffTheRoll(
+// A member who opted in is in the call, muted. They are not seated in the speaker socket,
+// so one arrival does not shout to every other listener.
+function listensMuted(
   preferPlayback: boolean,
   participantRole: 'HOST' | 'SPEAKER' | 'LISTENER',
   roomType: 'GENERAL' | 'PRAYER_WATCH' | 'CHANNEL_CALL',
@@ -142,19 +143,33 @@ function stationIsUp(room: { type: 'GENERAL' | 'PRAYER_WATCH' | 'CHANNEL_CALL'; 
   return isOpenMicRoom(room.type) && !!room.playbackUrl;
 }
 
-async function onlyPersonOnTheCall(roomId: string): Promise<boolean> {
-  const stillHere = await prisma.audioRoomParticipant.count({ where: { roomId, leftAt: null } });
-  return stillHere <= 1;
+async function onlySpeakerLeft(roomId: string): Promise<boolean> {
+  const speakers = await prisma.audioRoomParticipant.count({
+    where: { roomId, leftAt: null, role: { in: ['HOST', 'SPEAKER'] } },
+  });
+  return speakers <= 1;
 }
 
-// Leaves the call roll. The phone then plays the station. Mic holders still in the room hear user-left.
-async function releaseFromRoll(roomId: string, userId: string, participantId: string) {
-  await prisma.audioRoomParticipant.update({
-    where: { id: participantId },
-    data: { leftAt: new Date() },
+async function emitListenerCount(roomId: string) {
+  const listenerCount = await prisma.audioRoomParticipant.count({
+    where: { roomId, leftAt: null, role: 'LISTENER' },
   });
+  emitToAudioRoom(roomId, 'audio-room:listeners', { roomId, listenerCount });
+}
+
+// Mute on a live station. The person stays in the call and hears the station.
+async function returnToListening(roomId: string, userId: string, participantId: string, playbackUrl: string | null) {
+  await prisma.audioRoomParticipant.update({ where: { id: participantId }, data: { role: 'LISTENER' } });
   leaveAudioRoom(userId, roomId);
-  emitToAudioRoom(roomId, 'audio-room:user-left', { roomId, userId });
+  emitToAudioRoom(roomId, 'audio-room:role-changed', { roomId, userId, role: 'LISTENER' });
+  emitPlayback(userId, roomId, playbackUrl);
+  await emitListenerCount(roomId);
+}
+
+// Unmute. The speaker socket is the only place that lists people who can speak.
+function seatSpeaker(roomId: string, userId: string, participantId: string) {
+  joinAudioRoom(userId, roomId);
+  emitToAudioRoom(roomId, 'audio-room:user-joined', withAgoraUid({ id: participantId, userId, role: 'SPEAKER' as const }));
 }
 
 const PARTICIPANT_SELECT = {
@@ -492,17 +507,19 @@ export const audioRoomService = {
     let participantRole: 'HOST' | 'SPEAKER' | 'LISTENER' = 'SPEAKER';
     if (!p) {
       participantRole = preferPlayback ? await roleForCrowdJoin(userId, role, scope, true) : 'SPEAKER';
-      // Listeners play the station and stay out of the roll. A mic is what adds them.
-      if (!listensOffTheRoll(preferPlayback, participantRole, roomType)) {
-        let created;
-        try {
-          created = await addParticipantIfLive(existing.id, userId, participantRole);
-        } catch (err) {
-          if ((err as { message?: string }).message === 'Room is not live') {
-            throw BadRequest('This call has ended');
-          }
-          throw err;
+      let created;
+      try {
+        created = await addParticipantIfLive(existing.id, userId, participantRole);
+      } catch (err) {
+        if ((err as { message?: string }).message === 'Room is not live') {
+          throw BadRequest('This call has ended');
         }
+        throw err;
+      }
+      // Joined listeners are in the call, muted. Only speakers sit in the speaker socket.
+      if (listensMuted(preferPlayback, participantRole, roomType)) {
+        await emitListenerCount(existing.id);
+      } else {
         joinAudioRoom(userId, existing.id);
         emitToAudioRoom(existing.id, 'audio-room:user-joined', withAgoraUid(created));
       }
@@ -510,13 +527,9 @@ export const audioRoomService = {
       const next = preferPlayback ? await roleForCrowdJoin(userId, role, scope, true) : 'SPEAKER';
       if (next === 'SPEAKER') {
         await prisma.audioRoomParticipant.update({ where: { id: p.id }, data: { role: 'SPEAKER' } });
-        emitToAudioRoom(existing.id, 'audio-room:role-changed', {
-          roomId: existing.id, userId, role: 'SPEAKER',
-        });
+        seatSpeaker(existing.id, userId, p.id);
+        await emitListenerCount(existing.id);
         participantRole = 'SPEAKER';
-      } else if (listensOffTheRoll(preferPlayback, 'LISTENER', roomType)) {
-        await releaseFromRoll(existing.id, userId, p.id);
-        participantRole = 'LISTENER';
       } else {
         participantRole = 'LISTENER';
       }
@@ -885,11 +898,17 @@ export const audioRoomService = {
       : null;
     if (existing?.role === 'LISTENER' && preferPlayback && isOpenMicRoom(room.type)) {
       const next = await roleForCrowdJoin(userId, role, room, true);
-      if (next === 'LISTENER') {
-        await releaseFromRoll(roomId, userId, existing.id);
+      if (next === 'SPEAKER') {
+        await prisma.audioRoomParticipant.update({ where: { id: existing.id }, data: { role: 'SPEAKER' } });
+        seatSpeaker(roomId, userId, existing.id);
+        await emitListenerCount(roomId);
         const detail = await this.get(userId, roomId, role, { channelRole });
-        return { ...detail, ...this.clientAudio(roomId, userId, 'LISTENER', true, room.playbackUrl, room.type) };
+        const audio = this.clientAudio(roomId, userId, 'SPEAKER', true, room.playbackUrl, room.type);
+        if (audio.agora) emitToUser(userId, 'audio-room:token', { roomId, ...audio.agora });
+        return { ...detail, ...audio };
       }
+      const detail = await this.get(userId, roomId, role, { channelRole });
+      return { ...detail, ...this.clientAudio(roomId, userId, 'LISTENER', true, room.playbackUrl, room.type) };
     }
     if (existing) throw BadRequest('Already in this room');
 
@@ -903,15 +922,14 @@ export const audioRoomService = {
       joinRole = canModerate ? 'SPEAKER' : 'LISTENER';
     }
 
-    if (listensOffTheRoll(preferPlayback, joinRole, room.type)) {
-      const detail = await this.get(userId, roomId, role, { channelRole });
-      return { ...detail, ...this.clientAudio(roomId, userId, joinRole, preferPlayback, room.playbackUrl, room.type) };
-    }
-
     const participant = await addParticipantIfLive(roomId, userId, joinRole);
 
-    emitToAudioRoom(roomId, 'audio-room:user-joined', withAgoraUid(participant));
-    joinAudioRoom(userId, roomId);
+    if (listensMuted(preferPlayback, joinRole, room.type)) {
+      await emitListenerCount(roomId);
+    } else {
+      emitToAudioRoom(roomId, 'audio-room:user-joined', withAgoraUid(participant));
+      joinAudioRoom(userId, roomId);
+    }
 
     const detail = await this.get(userId, roomId, role, { channelRole });
     const audio = this.clientAudio(roomId, userId, joinRole, preferPlayback, room.playbackUrl, room.type);
@@ -931,12 +949,17 @@ export const audioRoomService = {
     });
 
     leaveAudioRoom(userId, roomId);
-    emitToAudioRoom(roomId, 'audio-room:user-left', { roomId, userId });
 
     const room = await prisma.audioRoom.findUnique({
       where: { id: roomId },
       select: { isPersistent: true, channelId: true, type: true },
     });
+    // A listener was never on the speaker list. Tell that list the new count. A speaker leaving is user-left.
+    if (room && isOpenMicRoom(room.type) && p.role === 'LISTENER') {
+      await emitListenerCount(roomId);
+    } else {
+      emitToAudioRoom(roomId, 'audio-room:user-left', { roomId, userId });
+    }
 
     // Persistent rooms stay up when the starter leaves. If they were the only mic and
     // someone is still listening, the mic passes before we check whether the room is empty.
@@ -994,10 +1017,10 @@ export const audioRoomService = {
     if (!p) throw BadRequest('Not in this room');
     if (p.role !== 'SPEAKER') throw BadRequest('Only speakers can step down');
 
-    // A crowd call with a station leaves the roll. Named rooms stay in the channel as audience.
+    // Muting on a station keeps the person in the call. Named rooms stay in the channel as audience.
     if (room && stationIsUp(room)) {
-      if (await onlyPersonOnTheCall(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
-      await this.dropStationMic(roomId, userId, p.id, room.playbackUrl);
+      if (await onlySpeakerLeft(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
+      await returnToListening(roomId, userId, p.id, room.playbackUrl);
       return { ok: true, role: 'LISTENER' as const, playbackUrl: room.playbackUrl, agora: null };
     }
 
@@ -1033,8 +1056,8 @@ export const audioRoomService = {
       const protectedIds = await protectedMicIds(room, [{ userId: targetUserId, globalRole: target?.globalRole }]);
       if (protectedIds.has(targetUserId)) throw Forbidden('You cannot take this mic');
       if (room.playbackUrl) {
-        if (await onlyPersonOnTheCall(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
-        await this.dropStationMic(roomId, targetUserId, p.id, room.playbackUrl);
+        if (await onlySpeakerLeft(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
+        await returnToListening(roomId, targetUserId, p.id, room.playbackUrl);
       }
     }
 
@@ -1066,19 +1089,17 @@ export const audioRoomService = {
       );
       dropping = speakers.filter((speaker) => !protectedIds.has(speaker.userId));
       if (room.playbackUrl && dropping.length > 0) {
-        const active = await prisma.audioRoomParticipant.count({ where: { roomId, leftAt: null } });
-        if (active - dropping.length < 1) dropping = dropping.slice(1);
+        const speaking = await prisma.audioRoomParticipant.count({
+          where: { roomId, leftAt: null, role: { in: ['HOST', 'SPEAKER'] } },
+        });
+        if (speaking - dropping.length < 1) dropping = dropping.slice(1);
       }
     }
 
     for (const speaker of dropping) {
-      if (stationIsUp(room)) {
-        await releaseFromRoll(roomId, speaker.userId, speaker.id);
-        emitPlayback(speaker.userId, roomId, room.playbackUrl ?? null);
-      }
+      if (stationIsUp(room)) await returnToListening(roomId, speaker.userId, speaker.id, room.playbackUrl ?? null);
       emitToUser(speaker.userId, 'audio-room:muted', { roomId, mutedBy: actorUserId });
     }
-    if (stationIsUp(room) && dropping.length > 0) await this.settleStationRoll(roomId);
     emitToAudioRoom(roomId, 'audio-room:all-muted', {
       roomId, mutedBy: actorUserId, userIds: dropping.map((speaker) => speaker.userId),
     });
@@ -1160,8 +1181,8 @@ export const audioRoomService = {
     }
 
     if (targetRole === 'LISTENER' && stationIsUp(room)) {
-      if (await onlyPersonOnTheCall(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
-      await this.dropStationMic(roomId, targetUserId, p.id, room.playbackUrl);
+      if (await onlySpeakerLeft(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
+      await returnToListening(roomId, targetUserId, p.id, room.playbackUrl);
       return { ok: true };
     }
 
@@ -1175,6 +1196,10 @@ export const audioRoomService = {
     });
 
     if (targetRole === 'SPEAKER') {
+      if (isOpenMicRoom(room.type) && p.role === 'LISTENER') {
+        seatSpeaker(roomId, targetUserId, p.id);
+        await emitListenerCount(roomId);
+      }
       const token = this.issueToken(roomId, targetUserId, 'host');
       emitToUser(targetUserId, 'audio-room:token', { roomId, ...token });
     }
@@ -1226,16 +1251,15 @@ export const audioRoomService = {
       select: { id: true, role: true },
     });
 
+    if (!participant) throw BadRequest('Join the call before using the mic');
+
     if (!hold) {
-      if (!participant || participant.role === 'LISTENER') {
-        if (participant && stationIsUp(room) && !(await onlyPersonOnTheCall(roomId))) {
-          await releaseFromRoll(roomId, userId, participant.id);
-        }
+      if (participant.role === 'LISTENER') {
         return { ok: true, role: 'LISTENER' as const, playbackUrl: room.playbackUrl, agora: null };
       }
-      if (await onlyPersonOnTheCall(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
+      if (await onlySpeakerLeft(roomId)) throw BadRequest(LAST_MIC_MESSAGE);
       if (stationIsUp(room)) {
-        await this.dropStationMic(roomId, userId, participant.id, room.playbackUrl);
+        await returnToListening(roomId, userId, participant.id, room.playbackUrl);
         return { ok: true, role: 'LISTENER' as const, playbackUrl: room.playbackUrl, agora: null };
       }
       await prisma.audioRoomParticipant.update({ where: { id: participant.id }, data: { role: 'LISTENER' } });
@@ -1244,47 +1268,23 @@ export const audioRoomService = {
       return { ok: true, role: 'LISTENER' as const, playbackUrl: room.playbackUrl, agora: null };
     }
 
-    if (participant?.role === 'HOST' || participant?.role === 'SPEAKER') {
+    if (participant.role === 'HOST' || participant.role === 'SPEAKER') {
       const agora = this.issueToken(roomId, userId, 'host');
       return { ok: true, role: participant.role, playbackUrl: room.playbackUrl, agora };
     }
 
-    if (room.channelId) await requireChannelMember(userId, role, room.channelId);
     const self = await prisma.user.findUnique({ where: { id: userId }, select: { globalRole: true } });
     const protectedIds = await protectedMicIds(room, [{ userId, globalRole: self?.globalRole ?? role }]);
     if (!protectedIds.has(userId) && await countFreeMics({ ...room, id: roomId }) >= FREE_MIC_LIMIT) {
       throw BadRequest('All free mics are in use');
     }
 
-    if (!participant) {
-      let created;
-      try {
-        created = await addParticipantIfLive(roomId, userId, 'SPEAKER');
-      } catch (err) {
-        if ((err as { message?: string }).message === 'Room is not live') throw BadRequest('This call has ended');
-        throw err;
-      }
-      joinAudioRoom(userId, roomId);
-      emitToAudioRoom(roomId, 'audio-room:user-joined', withAgoraUid(created));
-    } else {
-      await prisma.audioRoomParticipant.update({ where: { id: participant.id }, data: { role: 'SPEAKER' } });
-      emitToAudioRoom(roomId, 'audio-room:role-changed', { roomId, userId, role: 'SPEAKER' });
-    }
+    await prisma.audioRoomParticipant.update({ where: { id: participant.id }, data: { role: 'SPEAKER' } });
+    seatSpeaker(roomId, userId, participant.id);
+    await emitListenerCount(roomId);
     const agora = this.issueToken(roomId, userId, 'host');
     emitToUser(userId, 'audio-room:token', { roomId, ...agora });
     return { ok: true, role: 'SPEAKER' as const, playbackUrl: room.playbackUrl, agora };
-  },
-
-  // Mic left the roll. Pass it on if nobody is holding one, then end the service if the roll is empty.
-  async dropStationMic(roomId: string, userId: string, participantId: string, playbackUrl: string | null) {
-    await releaseFromRoll(roomId, userId, participantId);
-    emitPlayback(userId, roomId, playbackUrl);
-    await this.settleStationRoll(roomId);
-  },
-
-  async settleStationRoll(roomId: string) {
-    await this.passMicIfNoneRemain(roomId);
-    await endIfEmpty(roomId);
   },
 
   async refreshToken(userId: string, roomId: string) {

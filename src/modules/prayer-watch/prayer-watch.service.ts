@@ -85,7 +85,7 @@ export const prayerWatchService = {
   // Any authenticated user can start a call — but only when none is currently live. If a call
   // is already live, we attach the caller. Phones that omit preferPlayback still join as
   // speakers with a publisher token. A phone that sends it keeps a mic for the starter and
-  // for admins. Everyone else gets the station link and is not added to the call roll.
+  // for admins. Everyone else joins muted, hears the station, and is not seated with the speakers.
   async start(userId: string, role: string, preferPlayback = false) {
     const channel = await findGlobalPrayerWatchChannel(); // ensures the channel exists — catches misconfigured envs
 
