@@ -184,7 +184,9 @@ Errors come back with a status, a short code (such as `FORBIDDEN`) and a message
 
 ### Station listening (new phones only)
 
-Current phones do not send `preferPlayback`. They keep receiving `agora` and join as speakers, exactly as the rules above describe. Ship this section with the app update. Until that build is in the store, the Agora bill does not drop.
+Implement the phone from `docs/STATION_CALLS_FRONTEND_GUIDE.md`. That file is the contract: request bodies, response JSON, the HLS and Agora state machine, which socket events a muted member does and does not receive, and the error table. The bullets below are the summary. If they ever disagree with that file, follow that file.
+
+Current phones do not send `preferPlayback`. They keep receiving `agora` and join as speakers, exactly as the rules above describe. Ship the station guide with the app update. Until that build is in the store, the Agora bill does not drop.
 
 Send `{ "preferPlayback": true }` on:
 
